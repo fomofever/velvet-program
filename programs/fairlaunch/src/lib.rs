@@ -732,8 +732,23 @@ pub mod fairlaunch {
         let q = math::quote_buy(l.virtual_sol, l.virtual_token, l.real_token, lamports_in - gross_fee).fx()?;
         let fee = if q.completes_curve { math::fee_amount(q.sol_used, fee_bps).fx()? } else { gross_fee };
         require!(q.tokens_out >= min_tokens_out, FairError::Slippage);
-        // Anti-whale while bonding: no curve buy may take a wallet above 3% of supply.
-        let held_after = ctx.accounts.user_ata.amount.checked_add(q.tokens_out).ok_or(FairError::Overflow)?;
+        // Anti-whale while bonding: no curve buy may take a wallet above 3% of supply. Tokens the
+        // wallet is still owed count too: an unclaimed line share and, for the creator, the bag
+        // still in escrow.
+        let pending_line = {
+            let info = ctx.accounts.commitment.to_account_info();
+            if info.owner == &crate::ID && !info.data_is_empty() && !l.cancelled && l.total_committed > 0 {
+                let c = Commitment::try_deserialize(&mut &info.data.borrow()[..])?;
+                math::pro_rata(l.batch_tokens, c.amount, l.total_committed).fx()?
+            } else {
+                0
+            }
+        };
+        let in_escrow = if ctx.accounts.user.key() == l.creator { l.creator_tokens.saturating_sub(l.creator_claimed) } else { 0 };
+        let held_after = ctx.accounts.user_ata.amount
+            .checked_add(q.tokens_out).ok_or(FairError::Overflow)?
+            .checked_add(pending_line).ok_or(FairError::Overflow)?
+            .checked_add(in_escrow).ok_or(FairError::Overflow)?;
         require!(held_after <= MAX_WALLET_TOKENS_BONDING, FairError::WalletCapExceeded);
 
         let system = ctx.accounts.system_program.to_account_info();
@@ -1471,6 +1486,10 @@ pub struct TradeCtx<'info> {
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
+    /// CHECK: the user's line commitment for this coin (usually empty). Its address is fixed by
+    /// the seeds; buys count any unclaimed line tokens in it toward the 3% cap.
+    #[account(seeds = [COMMIT_SEED, launch.key().as_ref(), user.key().as_ref()], bump)]
+    pub commitment: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]

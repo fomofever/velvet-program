@@ -265,6 +265,7 @@ fn trade(env: &mut Env, l: &L, u: &Keypair, buy: bool, amount: u64) -> Result<()
             user: u.pubkey(), config: env.config, treasury: env.treasury, launch: l.launch, mint: l.mint, vault: l.vault,
             user_ata: ata(&u.pubkey(), &l.mint), token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID,
             system_program: system_program::ID,
+            commitment: Pubkey::find_program_address(&[COMMIT_SEED, l.launch.as_ref(), u.pubkey().as_ref()], &pid()).0,
         }.to_account_metas(None),
         data,
     };
@@ -841,6 +842,35 @@ fn the_line_and_the_opening_buy_are_held_to_three_percent() {
     claim(&mut env, &l, &creator).unwrap();
     assert!(tok(&env.svm, &ata(&a.pubkey(), &l.mint)) <= MAX_WALLET_TOKENS_BONDING);
     assert!(tok(&env.svm, &ata(&creator.pubkey(), &l.mint)) + own <= MAX_WALLET_TOKENS_BONDING);
+}
+
+/// Buying on the curve before claiming doesn't get around the cap: an unclaimed line share and
+/// the creator's bag still in escrow both count.
+#[test]
+fn unclaimed_line_share_and_escrowed_bag_count_toward_three_percent() {
+    let mut env = setup();
+    let creator = user(&mut env.svm, 20);
+    let l = create(&mut env, &creator, seed(51), 3 * SOL / 2, 0, 86_400).unwrap();
+    let a = user(&mut env.svm, 20);
+    let most = line_max(&env, &l);
+    commit(&mut env, &l, &a, most).unwrap();
+    advance(&mut env.svm, AUCTION + DECAY, 400);
+    settle(&mut env, &l, &a).unwrap();
+    // a hasn't claimed yet: another 3% on the curve is refused, a small top-up isn't
+    let e = trade(&mut env, &l, &a, true, most).unwrap_err();
+    assert!(e.contains("WalletCapExceeded"), "{e}");
+    let s = launch_state(&env.svm, &l.launch);
+    let share = s.batch_tokens; // a is the whole line
+    let room = MAX_WALLET_TOKENS_BONDING - share;
+    assert!(room < MAX_WALLET_TOKENS_BONDING / 10, "line share already near 3%: room {room}");
+    claim(&mut env, &l, &a).unwrap();
+    let e = trade(&mut env, &l, &a, true, most).unwrap_err();
+    assert!(e.contains("WalletCapExceeded"), "{e}");
+    // the creator's escrowed bag counts while it vests
+    let bag = s.creator_tokens;
+    let e = trade(&mut env, &l, &creator, true, 3 * SOL / 2).unwrap_err();
+    assert!(e.contains("WalletCapExceeded"), "bag {bag} + new buy must stay under 3%: {e}");
+    trade(&mut env, &l, &creator, true, SOL / 50).unwrap();
 }
 
 /// 70/30 curve: 700M tokens on the curve, 300M into the pool. With virtual tokens
