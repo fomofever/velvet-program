@@ -169,9 +169,45 @@ pub fn split3(amount: u64, a_bps: u16, b_bps: u16) -> (u64, u64, u64) {
     (a, b, amount - a - b)
 }
 
+/// LP tokens for a Raydium CPMM deposit of at most `a` and `b`, given the pool's
+/// tradeable reserves `ra`, `rb` and its LP supply. Raydium rounds the required
+/// amounts up, so the result is checked against that and backed off if needed.
+/// Returns (lp, a_needed, b_needed); all zero if nothing can be deposited.
+pub fn lp_for_deposit(a: u64, b: u64, ra: u64, rb: u64, supply: u64) -> (u64, u64, u64) {
+    if a == 0 || b == 0 || ra == 0 || rb == 0 || supply == 0 {
+        return (0, 0, 0);
+    }
+    let s = supply as u128;
+    let need = |lp: u128, r: u64| -> u128 { (lp * r as u128 + s - 1) / s };
+    let mut lp = core::cmp::min(a as u128 * s / ra as u128, b as u128 * s / rb as u128);
+    while lp > 0 && (need(lp, ra) > a as u128 || need(lp, rb) > b as u128) {
+        lp -= 1;
+    }
+    if lp == 0 || lp > u64::MAX as u128 {
+        return (0, 0, 0);
+    }
+    (lp as u64, need(lp, ra) as u64, need(lp, rb) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lp_deposit_never_needs_more_than_offered() {
+        // Pool with 100 SOL and 200M tokens, LP supply 4.47e12.
+        let (ra, rb, supply) = (100_000_000_000u64, 200_000_000_000_000u64, 4_472_135_954_999u64);
+        for (a, b) in [(1_000_000_000u64, 1_000_000_000_000u64), (5_000, 7), (123_456_789, 999_999_999_999), (1, 1)] {
+            let (lp, na, nb) = lp_for_deposit(a, b, ra, rb, supply);
+            assert!(na <= a && nb <= b, "{a} {b} -> {lp} {na} {nb}");
+            if lp > 0 {
+                // Raydium's own ceiling math gives the same amounts.
+                assert_eq!(na as u128, (lp as u128 * ra as u128 + supply as u128 - 1) / supply as u128);
+            }
+        }
+        assert_eq!(lp_for_deposit(0, 5, ra, rb, supply), (0, 0, 0));
+        assert_eq!(lp_for_deposit(5, 5, 0, rb, supply), (0, 0, 0));
+    }
 
     const VS: u64 = 30_000_000_000; // 30 SOL virtual
     const VT: u64 = 1_073_000_000_000_000; // 1.073B tokens (6dp) virtual

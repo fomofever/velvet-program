@@ -78,6 +78,12 @@ pub enum FairError {
     RewardAboveShare,
     #[msg("Payout exceeds this epoch's budget")]
     EpochBudgetExceeded,
+    #[msg("This buy would take your wallet above 3% of the supply while the coin is bonding")]
+    WalletCapExceeded,
+    #[msg("Launch approval is missing, malformed or doesn't match this launch")]
+    BadApproval,
+    #[msg("Launch approval has expired")]
+    ApprovalExpired,
 }
 
 impl From<MathError> for FairError {

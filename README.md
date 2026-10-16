@@ -13,7 +13,8 @@ is exactly this code.
 
 ## What it does
 
-- `programs/fairlaunch/src/lib.rs` — instructions: create_launch, commit, settle, claim,
+- `programs/fairlaunch/src/lib.rs` — instructions: create_launch, create_launch_signed (free
+  launch: the creator's Ed25519 approval is checked on-chain, the first buyer pays the rent), commit, settle, claim,
   claim_vested, refund_creator, buy, sell, distribute_rewards, prepare_graduation, graduate,
   lock_liquidity, collect_pool_fees, plus admin: init_config, propose_config / apply_config /
   cancel_config (timelocked), disable_distributor, transfer_authority / accept_authority
@@ -26,7 +27,9 @@ is exactly this code.
 Every coin is minted by the program with a fixed 1B supply and minting switched off in the same
 transaction. Openings are a single-price batch (the "line"), early flippers pay a decaying cover
 charge that goes to holders, and bonded coins move to a Raydium pool with 100% of the LP locked
-in Raydium's locker. Fee and limit changes wait out an on-chain timelock.
+in Raydium's locker. While bonding, no curve buy can take a wallet above 3% of the supply. A
+quarter of Velvet's share of the pool fees goes back into the pool as liquidity whose LP tokens
+are burned. Fee and limit changes wait out an on-chain timelock.
 
 ## Verify the deployed program
 

@@ -40,6 +40,25 @@ pub const MAX_AUCTION_SLOTS: u64 = 3_000;
 pub const MIN_REWARD_EPOCH_SECS: i64 = 60;
 pub const MAX_TIMELOCK_SECS: i64 = 30 * 86_400;
 
+/// While a coin is on the bonding curve, a curve buy can't take a wallet above this
+/// share of the supply (3%). Line claims, transfers and Raydium trades aren't limited.
+pub const MAX_WALLET_BPS_BONDING: u64 = 300;
+pub const MAX_WALLET_TOKENS_BONDING: u64 = TOTAL_SUPPLY / 10_000 * MAX_WALLET_BPS_BONDING;
+/// Share of Velvet's cut of Raydium pool fees that goes back into the pool as
+/// liquidity (paired with the collected coin side; the LP tokens are burned).
+pub const RECYCLE_TREASURY_BPS: u64 = 2_500;
+
+/// Free launches: the creator signs an approval message off-chain and whoever
+/// deploys the coin (normally its first buyer) pays the account rent.
+/// The message is human-readable text that starts with APPROVAL_PREFIX and ends
+/// with APPROVAL_TAG followed by the 64-hex-char digest of the launch parameters.
+pub const APPROVAL_PREFIX: &[u8] = b"Velvet launch approval\n";
+pub const APPROVAL_TAG: &[u8] = b"\nApproval: ";
+pub const APPROVAL_DOMAIN: &[u8] = b"velvet-launch-v1";
+pub const MAX_APPROVAL_LEN: usize = 640;
+/// Longest an approval may stay valid.
+pub const MAX_APPROVAL_SECS: i64 = 30 * 86_400;
+
 pub const MAX_NAME_LEN: usize = 32;
 pub const MAX_SYMBOL_LEN: usize = 10;
 pub const MAX_URI_LEN: usize = 200;
@@ -328,6 +347,21 @@ pub struct LiquidityLocked {
     pub pool: Pubkey,
     pub lp_amount: u64,
     pub fee_nft_mint: Pubkey,
+}
+
+#[event]
+pub struct LaunchSponsored {
+    pub launch: Pubkey,
+    pub creator: Pubkey,
+    pub payer: Pubkey,
+}
+
+#[event]
+pub struct LiquidityRecycled {
+    pub launch: Pubkey,
+    pub sol: u64,
+    pub tokens: u64,
+    pub lp_burned: u64,
 }
 
 #[event]

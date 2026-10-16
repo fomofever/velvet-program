@@ -110,7 +110,8 @@ fn init_config_ix(env_config: Pubkey, authority: &Pubkey, p: ConfigParams) -> In
     }
 }
 
-fn setup() -> Env {
+fn setup() -> Env { setup_with(|_| {}) }
+fn setup_with(tweak: impl Fn(&mut ConfigParams)) -> Env {
     let mut svm = LiteSVM::new();
     svm.add_program_from_file(cpmm(), "fixtures/raydium_cpmm.so").unwrap();
     svm.add_program_from_file(mpl(), "fixtures/mpl_token_metadata.so").unwrap();
@@ -136,7 +137,9 @@ fn setup() -> Env {
     svm.airdrop(&treasury, SOL).unwrap();
     let (config, _) = Pubkey::find_program_address(&[CONFIG_SEED], &pid());
     let mut env = Env { svm, admin, distributor, treasury, config };
-    let ix = init_config_ix(config, &env.admin.pubkey(), params(treasury, env.distributor.pubkey()));
+    let mut p = params(treasury, env.distributor.pubkey());
+    tweak(&mut p);
+    let ix = init_config_ix(config, &env.admin.pubkey(), p);
     let admin = env.admin.insecure_clone();
     send(&mut env.svm, vec![ix], &admin).unwrap();
     env
@@ -529,6 +532,7 @@ fn collect_fees(env: &mut Env, l: &L, creator: &Pubkey, payer: &Keypair) -> Resu
             locked_liquidity: raydium::lock::locked_liquidity(&lockp(), &s.fee_nft_mint), fee_nft_account: ata(&k.grad, &s.fee_nft_mint),
             locked_lp_vault: ata(&lock_auth, &k.lp_mint), token_2022_program: raydium::lock::TOKEN_2022, memo_program: raydium::lock::MEMO_PROGRAM,
             token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID,
+            grad_lp: ata(&k.grad, &k.lp_mint),
         }.to_account_metas(None),
         data: fairlaunch::instruction::CollectPoolFees {}.data(),
     };
@@ -591,7 +595,15 @@ fn graduates_into_raydium_burns_lp_and_collects_creator_fees() {
     let (dc, dr, dt) = (bal(&env.svm, &creator.pubkey()) - c0, s.reward_sol - r0, bal(&env.svm, &env.treasury) - t1);
     // LP fee on idx0: 0.25% trade fee minus 16% protocol/fund = 0.21% of the 20 SOL input,
     // paid out half in SOL and half in the coin (by pool value), so ~0.021 SOL on the SOL side.
-    assert_eq!(s.pool_fees_collected, dc + dr + dt);
+    // A quarter of Velvet's share went back into the pool as burned-LP liquidity.
+    let rec: LiquidityRecycled = event(&logs).expect("LiquidityRecycled event");
+    assert_eq!(s.pool_fees_collected, dc + dr + dt + rec.sol);
+    let treasury_share = s.pool_fees_collected - s.pool_fees_collected * 2_500 / 10_000 * 2;
+    assert!(rec.sol > 0 && rec.sol <= treasury_share / 4 + 1 && rec.sol + 5 >= treasury_share / 4, "recycled {} of {treasury_share}", rec.sol);
+    assert!(rec.tokens > 0 && rec.lp_burned > 0);
+    assert_eq!(tok(&env.svm, &ata(&k.grad, &k.lp_mint)), 0, "recycled LP was burned");
+    // (the locker realises fees by withdrawing a sliver of the locked LP; nothing else touches it)
+    assert!(tok(&env.svm, &ata(&lock_auth, &k.lp_mint)) <= lp_held);
     assert!(s.pool_fees_collected > 15_000_000 && s.pool_fees_collected < 30_000_000, "{}", s.pool_fees_collected);
     assert!(dc > 0 && dr > 0 && dt > dc, "creator {dc}, holders {dr}, treasury {dt}");
     // and again later (WSOL account was closed; Raydium recreates it)
@@ -603,6 +615,195 @@ fn graduates_into_raydium_burns_lp_and_collects_creator_fees() {
     let before = bal(&env.svm, &whales[6].pubkey());
     distribute_epoch(&mut env, &l, &dist, 1, &[(whales[6].pubkey(), 10_000)]).unwrap();
     assert_eq!(bal(&env.svm, &whales[6].pubkey()) - before, 10_000);
+}
+
+/// Decode the first Anchor event of type T from a transaction's logs.
+fn event<T: anchor_lang::AnchorDeserialize + anchor_lang::Discriminator>(logs: &[String]) -> Option<T> {
+    logs.iter().filter_map(|l| l.strip_prefix("Program data: ")).find_map(|b64| {
+        let d = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+        if d.len() < 8 || &d[..8] != T::DISCRIMINATOR { return None; }
+        T::deserialize(&mut &d[8..]).ok()
+    })
+}
+
+// ───────────────────────────── free launches ─────────────────────────────
+
+const FREE_NAME: &str = "Free Coin";
+const FREE_SYM: &str = "FREE";
+const FREE_URI: &str = "https://velvet.example/m/free.json";
+
+fn approval_text(digest: &[u8; 32], name: &str, symbol: &str) -> Vec<u8> {
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("Velvet launch approval\nLaunch {name} (${symbol}) on Velvet. Signing is free.\nApproval: {hex}").into_bytes()
+}
+
+struct Free { seed: [u8; 16], name: &'static str, auction: u64, min_raise: u64, vest: i64, expires: i64 }
+
+fn free(seed_n: u8, expires: i64) -> Free { Free { seed: seed(seed_n), name: FREE_NAME, auction: AUCTION, min_raise: 0, vest: 0, expires } }
+
+fn free_keys(seed: &[u8; 16]) -> L {
+    let (mint, _) = Pubkey::find_program_address(&[MINT_SEED, seed], &pid());
+    let (launch, _) = Pubkey::find_program_address(&[LAUNCH_SEED, mint.as_ref()], &pid());
+    let (escrow, _) = Pubkey::find_program_address(&[ESCROW_SEED, launch.as_ref()], &pid());
+    L { mint, launch, vault: ata(&launch, &mint), escrow }
+}
+
+/// [Ed25519 approval by `signer` over `msg`, create_launch_signed for `creator` paid by `payer`].
+fn free_ixs(env: &Env, f: &Free, signer: &Keypair, creator: Pubkey, payer: &Pubkey, msg: Option<Vec<u8>>) -> Vec<Instruction> {
+    let digest = fairlaunch::approval_digest(&f.seed, f.name, FREE_SYM, FREE_URI, f.auction, f.min_raise, f.vest, f.expires);
+    let msg = msg.unwrap_or_else(|| approval_text(&digest, f.name, FREE_SYM));
+    let sig: [u8; 64] = signer.sign_message(&msg).as_ref().try_into().unwrap();
+    let ed = solana_sdk::ed25519_instruction::new_ed25519_instruction_with_signature(&msg, &sig, &signer.pubkey().to_bytes());
+    let l = free_keys(&f.seed);
+    let (metadata, _) = Pubkey::find_program_address(&[b"metadata", mpl().as_ref(), l.mint.as_ref()], &mpl());
+    let ix = Instruction {
+        program_id: pid(),
+        accounts: fairlaunch::accounts::CreateLaunchSigned {
+            payer: *payer, config: env.config, mint: l.mint, launch: l.launch, vault: l.vault, escrow: l.escrow, metadata,
+            instructions: sysvar::instructions::ID, metadata_program: mpl(), token_program: spl_token::ID,
+            associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID, rent: sysvar::rent::ID,
+        }.to_account_metas(None),
+        data: fairlaunch::instruction::CreateLaunchSigned {
+            seed: f.seed, name: f.name.into(), symbol: FREE_SYM.into(), uri: FREE_URI.into(), auction_slots: f.auction,
+            min_raise: f.min_raise, vest_secs: f.vest, expires_at: f.expires, creator,
+        }.data(),
+    };
+    vec![ed, ix]
+}
+fn commit_ix(env: &Env, l: &L, u: &Pubkey, lamports: u64) -> Instruction {
+    let (commitment, _) = Pubkey::find_program_address(&[COMMIT_SEED, l.launch.as_ref(), u.as_ref()], &pid());
+    Instruction {
+        program_id: pid(),
+        accounts: fairlaunch::accounts::Commit { user: *u, config: env.config, launch: l.launch, commitment, system_program: system_program::ID }.to_account_metas(None),
+        data: fairlaunch::instruction::Commit { lamports }.data(),
+    }
+}
+fn now(svm: &LiteSVM) -> i64 { svm.get_sysvar::<Clock>().unix_timestamp }
+
+#[test]
+fn free_launch_creator_pays_nothing_and_first_buyer_deploys() {
+    let mut env = setup();
+    let creator = Keypair::new(); // no SOL at all
+    let buyer = user(&mut env.svm, 10);
+    let f = free(40, now(&env.svm) + 86_400);
+    let mut ixs = free_ixs(&env, &f, &creator, creator.pubkey(), &buyer.pubkey(), None);
+    let l = free_keys(&f.seed);
+    ixs.push(commit_ix(&env, &l, &buyer.pubkey(), SOL));
+    let b0 = bal(&env.svm, &buyer.pubkey());
+    let logs = send(&mut env.svm, ixs, &buyer).unwrap();
+    println!("free launch + first commit CU: {:?}", logs.iter().find(|x| x.contains(&format!("{} consumed", pid()))));
+    assert_eq!(bal(&env.svm, &creator.pubkey()), 0, "creator spent nothing");
+    let spent = b0 - bal(&env.svm, &buyer.pubkey());
+    assert!(spent > SOL && spent < SOL + 30_000_000, "buyer paid the commit plus ~0.02 SOL of rent: {spent}");
+    let s = launch_state(&env.svm, &l.launch);
+    assert_eq!(s.creator, creator.pubkey());
+    assert_eq!((s.creator_buy_sol, s.creator_tokens, s.committers, s.total_committed), (0, 0, 1, SOL));
+    assert_eq!(tok(&env.svm, &l.vault), TOTAL_SUPPLY);
+    let sp: LaunchSponsored = event(&logs).unwrap();
+    assert_eq!((sp.creator, sp.payer), (creator.pubkey(), buyer.pubkey()));
+    let md = Pubkey::find_program_address(&[b"metadata", mpl().as_ref(), l.mint.as_ref()], &mpl()).0;
+    assert_eq!(env.svm.get_account(&md).unwrap().owner, mpl(), "metadata written");
+    // it's a normal coin from here on
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &buyer).unwrap();
+    claim(&mut env, &l, &buyer).unwrap();
+    assert!(tok(&env.svm, &ata(&buyer.pubkey(), &l.mint)) > 0);
+    // the same approval can't deploy a second coin
+    let again = free_ixs(&env, &f, &creator, creator.pubkey(), &buyer.pubkey(), None);
+    assert!(send(&mut env.svm, again, &buyer).is_err());
+}
+
+#[test]
+fn forged_tampered_or_stale_approvals_are_rejected() {
+    let mut env = setup();
+    let victim = Keypair::new();
+    let attacker = user(&mut env.svm, 10);
+    let t = now(&env.svm);
+    let bad = |e: Result<Vec<String>, String>, want: &str| { let e = e.unwrap_err(); assert!(e.contains(want), "expected {want}: {e}"); };
+
+    // someone else's signature claiming to be the victim
+    let f = free(41, t + 3_600);
+    bad({ let ixs = free_ixs(&env, &f, &attacker, victim.pubkey(), &attacker.pubkey(), None); send(&mut env.svm, ixs, &attacker) }, "BadApproval");
+    // victim approved one coin; the attacker submits different parameters
+    let signed = free(42, t + 3_600);
+    let digest = fairlaunch::approval_digest(&signed.seed, signed.name, FREE_SYM, FREE_URI, signed.auction, signed.min_raise, signed.vest, signed.expires);
+    let msg = approval_text(&digest, signed.name, FREE_SYM);
+    let mut changed = free(42, t + 3_600);
+    changed.min_raise = 3 * SOL;
+    bad({ let ixs = free_ixs(&env, &changed, &victim, victim.pubkey(), &attacker.pubkey(), Some(msg.clone())); send(&mut env.svm, ixs, &attacker) }, "BadApproval");
+    changed = free(42, t + 3_600);
+    changed.name = "Other";
+    bad({ let ixs = free_ixs(&env, &changed, &victim, victim.pubkey(), &attacker.pubkey(), Some(msg)); send(&mut env.svm, ixs, &attacker) }, "BadApproval");
+    // no approval instruction at all
+    let mut ixs = free_ixs(&env, &free(43, t + 3_600), &victim, victim.pubkey(), &attacker.pubkey(), None);
+    ixs.remove(0);
+    bad(send(&mut env.svm, ixs, &attacker), "BadApproval");
+    // a signature over text that isn't a Velvet approval (e.g. a login message)
+    let f = free(44, t + 3_600);
+    let d = fairlaunch::approval_digest(&f.seed, f.name, FREE_SYM, FREE_URI, f.auction, f.min_raise, f.vest, f.expires);
+    let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
+    let login = format!("Sign in to some site\nApproval: {hex}").into_bytes();
+    bad({ let ixs = free_ixs(&env, &f, &victim, victim.pubkey(), &attacker.pubkey(), Some(login)); send(&mut env.svm, ixs, &attacker) }, "BadApproval");
+    // expired, or valid for too long
+    bad({ let ixs = free_ixs(&env, &free(45, t - 1), &victim, victim.pubkey(), &attacker.pubkey(), None); send(&mut env.svm, ixs, &attacker) }, "ApprovalExpired");
+    bad({ let ixs = free_ixs(&env, &free(46, t + 31 * 86_400), &victim, victim.pubkey(), &attacker.pubkey(), None); send(&mut env.svm, ixs, &attacker) }, "BadApproval");
+    // a valid approval still works (the failures above weren't something else)
+    { let ixs = free_ixs(&env, &free(47, t + 3_600), &victim, victim.pubkey(), &attacker.pubkey(), None); send(&mut env.svm, ixs, &attacker) }.unwrap();
+    assert_eq!(launch_state(&env.svm, &free_keys(&seed(47)).launch).creator, victim.pubkey());
+}
+
+#[test]
+fn no_wallet_can_buy_past_three_percent_while_bonding() {
+    let mut env = setup();
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(48), 0, 0, 0).unwrap();
+    let a = user(&mut env.svm, 20);
+    commit(&mut env, &l, &a, SOL / 10).unwrap();
+    advance(&mut env.svm, AUCTION + DECAY, 400);
+    settle(&mut env, &l, &a).unwrap();
+    let whale = user(&mut env.svm, 50);
+    let e = trade(&mut env, &l, &whale, true, 20 * SOL).unwrap_err();
+    assert!(e.contains("WalletCapExceeded"), "{e}");
+    // small buys are fine until the wallet reaches 3%
+    trade(&mut env, &l, &whale, true, SOL / 2).unwrap();
+    let mut n = 0;
+    while trade(&mut env, &l, &whale, true, SOL / 2).is_ok() { n += 1; assert!(n < 100); }
+    let held = tok(&env.svm, &ata(&whale.pubkey(), &l.mint));
+    assert!(held <= MAX_WALLET_TOKENS_BONDING && held > MAX_WALLET_TOKENS_BONDING * 8 / 10, "held {held}");
+    // selling is never limited
+    trade(&mut env, &l, &whale, false, held / 2).unwrap();
+}
+
+/// 70/30 curve: 700M tokens on the curve, 300M into the pool. With virtual tokens
+/// VT = C^2 / (C - LP) the pool opens at the curve's last price, so bonding doesn't
+/// jump the price. Pure config: no program change needed.
+#[test]
+fn seventy_thirty_curve_bonds_at_the_curve_price() {
+    const CT: u64 = 700_000_000_000_000;
+    const VT: u64 = 1_225_000_000_000_000; // 700^2 / (700 - 300) = 1225M
+    // Small raise so the test can fill it: bonds at ~20 SOL (V0 = R (VT - C) / C).
+    const RAISE: u64 = 20 * SOL;
+    let mut env = setup_with(|p| { p.curve_tokens = CT; p.virtual_tokens = VT; p.virtual_sol = (RAISE as u128 * (VT - CT) as u128 / CT as u128) as u64; });
+    let creator = user(&mut env.svm, 5);
+    let l = create(&mut env, &creator, seed(49), 0, 0, 0).unwrap();
+    let s = launch_state(&env.svm, &l.launch);
+    assert_eq!((s.real_token, s.lp_reserve), (CT, TOTAL_SUPPLY - CT));
+    let ws: Vec<Keypair> = (0..6).map(|_| user(&mut env.svm, 10)).collect();
+    for w in &ws { commit(&mut env, &l, w, CAP).unwrap(); }
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &ws[0]).unwrap();
+    let s = launch_state(&env.svm, &l.launch);
+    assert!(s.complete, "30 SOL of line fills a 20 SOL curve");
+    let end_price = s.virtual_sol as f64 / s.virtual_token as f64;
+    graduate(&mut env, &l, &ws[1]).unwrap();
+    let k = pool_keys(&env, &l);
+    let (tv, sv) = if k.m0 == wsol() { (k.v1, k.v0) } else { (k.v0, k.v1) };
+    assert_eq!(tok(&env.svm, &tv), TOTAL_SUPPLY - CT, "pool holds 30% of the supply");
+    let pool_price = tok(&env.svm, &sv) as f64 / tok(&env.svm, &tv) as f64;
+    let gap = (pool_price / end_price - 1.0).abs();
+    println!("70/30: curve end price {end_price:.3e}, pool price {pool_price:.3e}, gap {:.2}%", gap * 100.0);
+    // the pool only misses the curve price by the bonding fee and pool overhead
+    assert!(pool_price <= end_price && gap < 0.08, "gap {gap}");
 }
 
 // ───────────────────────────── attack tests ─────────────────────────────

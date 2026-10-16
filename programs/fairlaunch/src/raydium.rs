@@ -137,6 +137,63 @@ pub fn collect_creator_fee_ix(k: &CollectKeys) -> Instruction {
 }
 
 // ── Raydium liquidity locker ("Burn & Earn") ──
+pub const IX_DEPOSIT: [u8; 8] = [242, 35, 198, 137, 82, 225, 242, 182];
+
+pub struct DepositKeys {
+    pub program: Pubkey,
+    pub owner: Pubkey,
+    pub authority: Pubkey,
+    pub pool_state: Pubkey,
+    pub owner_lp_token: Pubkey,
+    pub token_0_account: Pubkey,
+    pub token_1_account: Pubkey,
+    pub token_0_vault: Pubkey,
+    pub token_1_vault: Pubkey,
+    pub token_program: Pubkey,
+    pub token_program_2022: Pubkey,
+    pub vault_0_mint: Pubkey,
+    pub vault_1_mint: Pubkey,
+    pub lp_mint: Pubkey,
+}
+
+/// CPMM `deposit`: mint `lp` LP tokens for at most (max_0, max_1) of the two tokens.
+pub fn deposit_ix(k: &DepositKeys, lp: u64, max_0: u64, max_1: u64) -> Instruction {
+    let mut data = IX_DEPOSIT.to_vec();
+    data.extend_from_slice(&lp.to_le_bytes());
+    data.extend_from_slice(&max_0.to_le_bytes());
+    data.extend_from_slice(&max_1.to_le_bytes());
+    Instruction {
+        program_id: k.program,
+        accounts: vec![
+            AccountMeta::new_readonly(k.owner, true),
+            AccountMeta::new_readonly(k.authority, false),
+            AccountMeta::new(k.pool_state, false),
+            AccountMeta::new(k.owner_lp_token, false),
+            AccountMeta::new(k.token_0_account, false),
+            AccountMeta::new(k.token_1_account, false),
+            AccountMeta::new(k.token_0_vault, false),
+            AccountMeta::new(k.token_1_vault, false),
+            AccountMeta::new_readonly(k.token_program, false),
+            AccountMeta::new_readonly(k.token_program_2022, false),
+            AccountMeta::new_readonly(k.vault_0_mint, false),
+            AccountMeta::new_readonly(k.vault_1_mint, false),
+            AccountMeta::new(k.lp_mint, false),
+        ],
+        data,
+    }
+}
+
+/// The pool's LP supply and the fees Raydium holds back in each vault
+/// (protocol + fund + creator), read from the CPMM PoolState account.
+/// Tradeable reserve = vault balance minus these fees, as Raydium computes it.
+pub fn pool_lp_and_fees(pool_data: &[u8]) -> Option<(u64, u64, u64)> {
+    let rd = |o: usize| -> Option<u64> { pool_data.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap())) };
+    let lp_supply = rd(333)?;
+    let f0 = rd(341)?.checked_add(rd(357)?)?.checked_add(rd(397)?)?;
+    let f1 = rd(349)?.checked_add(rd(365)?)?.checked_add(rd(405)?)?;
+    Some((lp_supply, f0, f1))
+}
+
 pub mod lock {
     use super::*;
     pub const IX_LOCK_CP_LIQUIDITY: [u8; 8] = [216, 157, 29, 78, 38, 51, 31, 26];
