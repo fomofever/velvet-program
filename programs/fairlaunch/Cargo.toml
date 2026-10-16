@@ -1,0 +1,23 @@
+[package]
+name = "fairlaunch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+description = "Anti-snipe fair launchpad: PDA-owned mints, atomic creator buy, uniform-price batch auction opening, decaying snipe fee"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "fairlaunch"
+
+[features]
+default = []
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
+anchor-spl = { version = "0.31.1", features = ["token", "associated_token", "metadata"] }
+

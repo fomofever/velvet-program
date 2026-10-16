@@ -1,0 +1,1372 @@
+//! FairLaunch v2 — the program behind Velvet.
+//!
+//! Anti-snipe launches:
+//!   1. The program deploys every coin. The mint is a PDA (Velvet grinds seeds so
+//!      addresses end in "vLvt"), metadata is written, minting is switched off.
+//!   2. The creator's opening buy happens in the launch transaction, at the start
+//!      price, into an escrow that vests linearly.
+//!   3. The curve is locked for an opening window. Buyers commit SOL ("the line").
+//!   4. Settlement runs the whole line as one buy at one price. If the line is below
+//!      the creator's minimum, the launch is cancelled and everyone is refunded.
+//!   5. Trading opens with a fee that decays from 50% to 1%. Part of every fee, and
+//!      most of the cover-charge premium, goes to a holder reward pool paid out by
+//!      hold streak.
+//!   6. When the curve fills, anyone can graduate it into a Raydium CPMM pool. The
+//!      LP tokens are burned and Raydium's creator fee keeps flowing to the
+//!      treasury, the creator and holders.
+
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program::invoke_signed;
+use anchor_lang::system_program;
+use anchor_spl::associated_token::{self, AssociatedToken};
+use anchor_spl::metadata::{
+    create_metadata_accounts_v3, mpl_token_metadata::types::DataV2, CreateMetadataAccountsV3, Metadata,
+};
+use anchor_spl::token::{self, spl_token, Mint, SetAuthority, Token, TokenAccount, Transfer};
+
+pub mod errors;
+pub mod math;
+pub mod raydium;
+pub mod state;
+
+use errors::{FairError, MathExt};
+use state::*;
+
+declare_id!("8f9XtMzn9J8vapxoLoypKUjNta64jhjfr18WMVCn5yAk");
+
+impl ConfigParams {
+    fn validate(&self) -> Result<()> {
+        require!(
+            self.base_fee_bps <= MAX_BASE_FEE_BPS
+                && self.holder_fee_bps <= self.base_fee_bps
+                && self.max_snipe_fee_bps <= MAX_SNIPE_FEE_BPS
+                && self.base_fee_bps <= self.max_snipe_fee_bps
+                && self.graduation_fee <= MAX_GRADUATION_FEE
+                && self.decay_slots <= MAX_DECAY_SLOTS
+                && self.max_auction_slots <= MAX_AUCTION_SLOTS
+                && self.min_reward_epoch_secs >= MIN_REWARD_EPOCH_SECS
+                && self.treasury != Pubkey::default()
+                && self.cover_to_holders_bps <= 10_000
+                && (self.pool_fee_creator_bps as u32 + self.pool_fee_holders_bps as u32) <= 10_000
+                && self.min_auction_slots > 0
+                && self.min_auction_slots <= self.max_auction_slots
+                && self.per_wallet_commit_cap > 0
+                && self.max_vest_secs >= 0
+                && self.virtual_sol > 0
+                && self.curve_tokens > 0
+                && self.curve_tokens < TOTAL_SUPPLY
+                && self.virtual_tokens > self.curve_tokens,
+            FairError::InvalidConfig
+        );
+        Ok(())
+    }
+    fn apply(&self, c: &mut Config) {
+        c.treasury = self.treasury;
+        c.distributor = self.distributor;
+        c.cpmm_program = self.cpmm_program;
+        c.amm_config = self.amm_config;
+        c.lock_program = self.lock_program;
+        c.base_fee_bps = self.base_fee_bps;
+        c.holder_fee_bps = self.holder_fee_bps;
+        c.max_snipe_fee_bps = self.max_snipe_fee_bps;
+        c.cover_to_holders_bps = self.cover_to_holders_bps;
+        c.pool_fee_creator_bps = self.pool_fee_creator_bps;
+        c.pool_fee_holders_bps = self.pool_fee_holders_bps;
+        c.decay_slots = self.decay_slots;
+        c.min_auction_slots = self.min_auction_slots;
+        c.max_auction_slots = self.max_auction_slots;
+        c.per_wallet_commit_cap = self.per_wallet_commit_cap;
+        c.max_creator_buy = self.max_creator_buy;
+        c.max_min_raise = self.max_min_raise;
+        c.max_vest_secs = self.max_vest_secs;
+        c.graduation_fee = self.graduation_fee;
+        c.virtual_sol = self.virtual_sol;
+        c.virtual_tokens = self.virtual_tokens;
+        c.curve_tokens = self.curve_tokens;
+        c.min_reward_epoch_secs = self.min_reward_epoch_secs;
+    }
+}
+
+// ───────────────────────────── helpers ─────────────────────────────
+
+/// Move lamports out of an account this program owns.
+fn pay_from_pda<'info>(from: &AccountInfo<'info>, to: &AccountInfo<'info>, amount: u64) -> Result<()> {
+    if amount == 0 {
+        return Ok(());
+    }
+    **from.try_borrow_mut_lamports()? = from.lamports().checked_sub(amount).ok_or(FairError::Overflow)?;
+    **to.try_borrow_mut_lamports()? = to.lamports().checked_add(amount).ok_or(FairError::Overflow)?;
+    Ok(())
+}
+
+fn pay_from_user<'info>(system: &AccountInfo<'info>, from: &AccountInfo<'info>, to: &AccountInfo<'info>, amount: u64) -> Result<()> {
+    if amount == 0 {
+        return Ok(());
+    }
+    system_program::transfer(
+        CpiContext::new(system.clone(), system_program::Transfer { from: from.clone(), to: to.clone() }),
+        amount,
+    )
+}
+
+/// System transfer out of a PDA that is a plain system account (the graduation authority).
+fn pay_from_system_pda<'info>(system: &AccountInfo<'info>, from: &AccountInfo<'info>, to: &AccountInfo<'info>, amount: u64, seeds: &[&[&[u8]]]) -> Result<()> {
+    if amount == 0 {
+        return Ok(());
+    }
+    system_program::transfer(
+        CpiContext::new_with_signer(system.clone(), system_program::Transfer { from: from.clone(), to: to.clone() }, seeds),
+        amount,
+    )
+}
+
+/// Split a fee: holders' part stays in the launch account (reward pool), the rest
+/// goes to the treasury. Returns the holders' part. `fee_source_is_launch` says
+/// whether the fee lamports already sit in the launch account.
+fn route_fee<'info>(
+    cfg: &Config,
+    l: &mut Account<'info, Launch>,
+    fee: u64,
+    fee_bps: u16,
+    payer: Option<(&AccountInfo<'info>, &AccountInfo<'info>)>, // (system_program, user) if a user pays
+    treasury: &AccountInfo<'info>,
+) -> Result<u64> {
+    let (to_holders, to_treasury) =
+        math::split_fee(fee, fee_bps, cfg.base_fee_bps, cfg.holder_fee_bps, cfg.cover_to_holders_bps).fx()?;
+    match payer {
+        Some((system, user)) => {
+            pay_from_user(system, user, &l.to_account_info(), to_holders)?;
+            pay_from_user(system, user, treasury, to_treasury)?;
+        }
+        None => {
+            pay_from_pda(&l.to_account_info(), treasury, to_treasury)?;
+        }
+    }
+    l.reward_sol = l.reward_sol.checked_add(to_holders).ok_or(FairError::Overflow)?;
+    Ok(to_holders)
+}
+
+macro_rules! launch_signer {
+    ($launch:expr, $name:ident) => {
+        let __mint: Pubkey = $launch.mint;
+        let __bump = [$launch.bump];
+        let __seeds: [&[u8]; 3] = [LAUNCH_SEED, __mint.as_ref(), &__bump];
+        let $name: &[&[&[u8]]] = &[&__seeds];
+    };
+}
+
+macro_rules! grad_signer {
+    ($launch_key:expr, $bump:expr, $name:ident) => {
+        let __key: Pubkey = $launch_key;
+        let __bump = [$bump];
+        let __seeds: [&[u8]; 3] = [GRAD_SEED, __key.as_ref(), &__bump];
+        let $name: &[&[&[u8]]] = &[&__seeds];
+    };
+}
+
+fn fee_now(cfg: &Config, l: &Launch, slot: u64) -> u16 {
+    math::fee_bps_at(slot, l.trading_start_slot, cfg.decay_slots, cfg.max_snipe_fee_bps, cfg.base_fee_bps)
+}
+
+fn token_amount(acc: &AccountInfo) -> Result<u64> {
+    let data = acc.try_borrow_data()?;
+    let a = spl_token::state::Account::unpack_from_slice(&data).map_err(|_| error!(FairError::WrongPoolAccount))?;
+    Ok(a.amount)
+}
+
+use anchor_lang::solana_program::program_pack::Pack;
+
+#[program]
+pub mod fairlaunch {
+    use super::*;
+
+    pub fn init_config(ctx: Context<InitConfig>, params: ConfigParams, timelock_secs: i64) -> Result<()> {
+        params.validate()?;
+        require!((0..=MAX_TIMELOCK_SECS).contains(&timelock_secs), FairError::InvalidConfig);
+        let c = &mut ctx.accounts.config;
+        c.authority = ctx.accounts.authority.key();
+        c.bump = ctx.bumps.config;
+        c.timelock_secs = timelock_secs;
+        params.apply(c);
+        Ok(())
+    }
+
+    /// Queue a config change. It can only be applied after the current timelock,
+    /// so everyone sees fee or treasury changes coming. The Raydium program, AMM
+    /// config and locker are fixed for the life of the program.
+    pub fn propose_config(ctx: Context<AdminConfig>, params: ConfigParams, timelock_secs: i64) -> Result<()> {
+        params.validate()?;
+        require!((0..=MAX_TIMELOCK_SECS).contains(&timelock_secs), FairError::InvalidConfig);
+        let c = &mut ctx.accounts.config;
+        require!(
+            params.cpmm_program == c.cpmm_program && params.amm_config == c.amm_config && params.lock_program == c.lock_program,
+            FairError::ImmutableField
+        );
+        let eta = Clock::get()?.unix_timestamp.checked_add(c.timelock_secs).ok_or(FairError::Overflow)?.max(1);
+        c.pending = params.clone();
+        c.pending_timelock_secs = timelock_secs;
+        c.pending_eta = eta;
+        emit!(ConfigProposed { eta, params, timelock_secs });
+        Ok(())
+    }
+
+    /// Apply the queued change once its timelock has passed. Anyone can call it.
+    pub fn apply_config(ctx: Context<ApplyConfig>) -> Result<()> {
+        let c = &mut ctx.accounts.config;
+        require!(c.pending_eta != 0, FairError::NoPendingChange);
+        require!(Clock::get()?.unix_timestamp >= c.pending_eta, FairError::TimelockNotReady);
+        let p = c.pending.clone();
+        p.validate()?;
+        p.apply(c);
+        c.timelock_secs = c.pending_timelock_secs;
+        c.pending = ConfigParams::default();
+        c.pending_eta = 0;
+        emit!(ConfigApplied { params: p, timelock_secs: c.timelock_secs });
+        Ok(())
+    }
+
+    pub fn cancel_config(ctx: Context<AdminConfig>) -> Result<()> {
+        let c = &mut ctx.accounts.config;
+        c.pending = ConfigParams::default();
+        c.pending_eta = 0;
+        Ok(())
+    }
+
+    /// Emergency brake: instantly switch hold-streak payouts off (no timelock, since
+    /// it can only stop money moving). Turning them back on goes through the timelock.
+    pub fn disable_distributor(ctx: Context<AdminConfig>) -> Result<()> {
+        ctx.accounts.config.distributor = Pubkey::default();
+        Ok(())
+    }
+
+    /// Hand the config to a new authority (e.g. a Squads multisig). Two steps so a
+    /// typo can't lose control.
+    pub fn transfer_authority(ctx: Context<AdminConfig>, new_authority: Pubkey) -> Result<()> {
+        ctx.accounts.config.pending_authority = new_authority;
+        Ok(())
+    }
+
+    pub fn accept_authority(ctx: Context<AcceptAuthority>) -> Result<()> {
+        let c = &mut ctx.accounts.config;
+        require_keys_eq!(ctx.accounts.new_authority.key(), c.pending_authority, FairError::NotPendingAuthority);
+        c.authority = c.pending_authority;
+        c.pending_authority = Pubkey::default();
+        emit!(AuthorityChanged { authority: c.authority });
+        Ok(())
+    }
+
+    /// Create the coin: PDA mint, metadata, fixed supply, minting off, creator buy
+    /// into vesting escrow, opening line starts. All in one instruction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_launch(
+        ctx: Context<CreateLaunch>,
+        seed: [u8; SEED_LEN],
+        name: String,
+        symbol: String,
+        uri: String,
+        auction_slots: u64,
+        creator_buy_lamports: u64,
+        min_raise: u64,
+        vest_secs: i64,
+    ) -> Result<()> {
+        let cfg = &ctx.accounts.config;
+        require!(name.len() <= MAX_NAME_LEN && symbol.len() <= MAX_SYMBOL_LEN && uri.len() <= MAX_URI_LEN, FairError::MetadataTooLong);
+        require!(auction_slots >= cfg.min_auction_slots && auction_slots <= cfg.max_auction_slots, FairError::InvalidAuctionWindow);
+        require!(creator_buy_lamports <= cfg.max_creator_buy, FairError::CreatorBuyTooLarge);
+        require!(min_raise <= cfg.max_min_raise, FairError::MinRaiseTooHigh);
+        require!(vest_secs >= 0 && vest_secs <= cfg.max_vest_secs, FairError::VestTooLong);
+        require_keys_eq!(ctx.accounts.treasury.key(), cfg.treasury, FairError::WrongTreasury);
+
+        let clock = Clock::get()?;
+        let l = &mut ctx.accounts.launch;
+        l.creator = ctx.accounts.creator.key();
+        l.mint = ctx.accounts.mint.key();
+        l.seed = seed;
+        l.name = name.clone();
+        l.symbol = symbol.clone();
+        l.uri = uri.clone();
+        l.virtual_sol = cfg.virtual_sol;
+        l.virtual_token = cfg.virtual_tokens;
+        l.real_token = cfg.curve_tokens;
+        l.lp_reserve = TOTAL_SUPPLY - cfg.curve_tokens;
+        l.created_slot = clock.slot;
+        l.created_at = clock.unix_timestamp;
+        l.auction_end_slot = clock.slot.checked_add(auction_slots).ok_or(FairError::Overflow)?;
+        l.min_raise = min_raise;
+        l.vest_secs = vest_secs;
+        l.bump = ctx.bumps.launch;
+        l.mint_bump = ctx.bumps.mint;
+        l.grad_bump = Pubkey::find_program_address(&[GRAD_SEED, l.key().as_ref()], &crate::ID).1;
+
+        launch_signer!(l, signer);
+        let token_prog = ctx.accounts.token_program.to_account_info();
+
+        // Metadata (immutable; update authority is the launch PDA).
+        create_metadata_accounts_v3(
+            CpiContext::new_with_signer(
+                ctx.accounts.metadata_program.to_account_info(),
+                CreateMetadataAccountsV3 {
+                    metadata: ctx.accounts.metadata.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    mint_authority: l.to_account_info(),
+                    payer: ctx.accounts.creator.to_account_info(),
+                    update_authority: l.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                    rent: ctx.accounts.rent.to_account_info(),
+                },
+                signer,
+            ),
+            DataV2 { name, symbol, uri, seller_fee_basis_points: 0, creators: None, collection: None, uses: None },
+            false,
+            true,
+            None,
+        )?;
+
+        token::mint_to(
+            CpiContext::new_with_signer(
+                token_prog.clone(),
+                token::MintTo { mint: ctx.accounts.mint.to_account_info(), to: ctx.accounts.vault.to_account_info(), authority: l.to_account_info() },
+                signer,
+            ),
+            TOTAL_SUPPLY,
+        )?;
+        token::set_authority(
+            CpiContext::new_with_signer(
+                token_prog.clone(),
+                SetAuthority { current_authority: l.to_account_info(), account_or_mint: ctx.accounts.mint.to_account_info() },
+                signer,
+            ),
+            spl_token::instruction::AuthorityType::MintTokens,
+            None,
+        )?;
+
+        if creator_buy_lamports > 0 {
+            let fee = math::fee_amount(creator_buy_lamports, cfg.base_fee_bps).fx()?;
+            let q = math::quote_buy(l.virtual_sol, l.virtual_token, l.real_token, creator_buy_lamports - fee).fx()?;
+            let system = ctx.accounts.system_program.to_account_info();
+            let creator = ctx.accounts.creator.to_account_info();
+            pay_from_user(&system, &creator, &l.to_account_info(), q.sol_used)?;
+            route_fee(cfg, l, fee, cfg.base_fee_bps, Some((&system, &creator)), &ctx.accounts.treasury.to_account_info())?;
+            token::transfer(
+                CpiContext::new_with_signer(
+                    token_prog,
+                    Transfer { from: ctx.accounts.vault.to_account_info(), to: ctx.accounts.escrow.to_account_info(), authority: l.to_account_info() },
+                    signer,
+                ),
+                q.tokens_out,
+            )?;
+            l.virtual_sol += q.sol_used;
+            l.virtual_token -= q.tokens_out;
+            l.real_sol += q.sol_used;
+            l.real_token -= q.tokens_out;
+            l.creator_buy_sol = q.sol_used;
+            l.creator_tokens = q.tokens_out;
+        }
+
+        emit!(LaunchCreated {
+            launch: l.key(),
+            mint: l.mint,
+            creator: l.creator,
+            creator_buy_sol: l.creator_buy_sol,
+            creator_tokens: l.creator_tokens,
+            auction_end_slot: l.auction_end_slot,
+            min_raise,
+            vest_secs,
+        });
+        Ok(())
+    }
+
+    /// Commit SOL to the opening line.
+    pub fn commit(ctx: Context<Commit>, lamports: u64) -> Result<()> {
+        require!(lamports > 0, FairError::ZeroAmount);
+        let slot = Clock::get()?.slot;
+        let l = &mut ctx.accounts.launch;
+        require!(!l.settled && slot < l.auction_end_slot, FairError::AuctionClosed);
+        let c = &mut ctx.accounts.commitment;
+        if c.amount == 0 {
+            c.launch = l.key();
+            c.owner = ctx.accounts.user.key();
+            c.bump = ctx.bumps.commitment;
+            l.committers = l.committers.checked_add(1).ok_or(FairError::Overflow)?;
+        }
+        let new_amount = c.amount.checked_add(lamports).ok_or(FairError::Overflow)?;
+        require!(new_amount <= ctx.accounts.config.per_wallet_commit_cap, FairError::CommitCapExceeded);
+        pay_from_user(&ctx.accounts.system_program.to_account_info(), &ctx.accounts.user.to_account_info(), &l.to_account_info(), lamports)?;
+        c.amount = new_amount;
+        l.total_committed = l.total_committed.checked_add(lamports).ok_or(FairError::Overflow)?;
+        l.escrow_sol = l.escrow_sol.checked_add(lamports).ok_or(FairError::Overflow)?;
+        emit!(Committed { launch: l.key(), user: c.owner, amount: lamports, user_total: c.amount, launch_total: l.total_committed });
+        Ok(())
+    }
+
+    /// Permissionless. After the window: cancel if below the minimum, otherwise run
+    /// the whole line as one buy at one price and open trading.
+    pub fn settle(ctx: Context<Settle>) -> Result<()> {
+        let clock = Clock::get()?;
+        let cfg = &ctx.accounts.config;
+        require_keys_eq!(ctx.accounts.treasury.key(), cfg.treasury, FairError::WrongTreasury);
+        let l = &mut ctx.accounts.launch;
+        require!(!l.settled, FairError::AlreadySettled);
+        require!(clock.slot >= l.auction_end_slot, FairError::AuctionRunning);
+
+        let total = l.total_committed;
+        let mut fee = 0u64;
+        l.settled = true;
+        l.trading_start_slot = clock.slot;
+        l.vest_start = clock.unix_timestamp;
+
+        if total < l.min_raise {
+            // Below the guest-list minimum: nobody trades, everyone gets their SOL back.
+            l.cancelled = true;
+        } else if total > 0 {
+            let gross_fee = math::fee_amount(total, cfg.base_fee_bps).fx()?;
+            let q = math::quote_buy(l.virtual_sol, l.virtual_token, l.real_token, total - gross_fee).fx()?;
+            fee = if q.completes_curve { math::fee_amount(q.sol_used, cfg.base_fee_bps).fx()? } else { gross_fee };
+            let refund = total - q.sol_used - fee;
+            l.virtual_sol += q.sol_used;
+            l.virtual_token -= q.tokens_out;
+            l.real_sol += q.sol_used;
+            l.real_token -= q.tokens_out;
+            l.batch_tokens = q.tokens_out;
+            l.unclaimed_batch = q.tokens_out;
+            l.batch_refund = refund;
+            l.escrow_sol = refund;
+            if q.completes_curve {
+                l.complete = true;
+            }
+            route_fee(cfg, l, fee, cfg.base_fee_bps, None, &ctx.accounts.treasury.to_account_info())?;
+        }
+        emit!(AuctionSettled {
+            launch: l.key(),
+            total_committed: total,
+            batch_tokens: l.batch_tokens,
+            batch_refund: l.batch_refund,
+            fee,
+            trading_start_slot: clock.slot,
+            cancelled: l.cancelled,
+        });
+        Ok(())
+    }
+
+    /// Claim your share of the line's tokens (plus overfill refund), or your full
+    /// refund if the launch was cancelled. Closes the commitment.
+    pub fn claim(ctx: Context<Claim>) -> Result<()> {
+        let l = &mut ctx.accounts.launch;
+        require!(l.settled, FairError::NotSettled);
+        let amt = ctx.accounts.commitment.amount;
+        let (tokens, refund) = if l.cancelled {
+            (0, amt)
+        } else {
+            (
+                math::pro_rata(l.batch_tokens, amt, l.total_committed).fx()?,
+                math::pro_rata(l.batch_refund, amt, l.total_committed).fx()?,
+            )
+        };
+        if tokens > 0 {
+            launch_signer!(l, signer);
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer { from: ctx.accounts.vault.to_account_info(), to: ctx.accounts.user_ata.to_account_info(), authority: l.to_account_info() },
+                    signer,
+                ),
+                tokens,
+            )?;
+            l.unclaimed_batch = l.unclaimed_batch.saturating_sub(tokens);
+        }
+        if refund > 0 {
+            l.escrow_sol = l.escrow_sol.checked_sub(refund).ok_or(FairError::Overflow)?;
+            pay_from_pda(&l.to_account_info(), &ctx.accounts.user.to_account_info(), refund)?;
+        }
+        emit!(Claimed { launch: l.key(), user: ctx.accounts.user.key(), tokens, refund });
+        Ok(())
+    }
+
+    /// Creator takes whatever part of their opening buy has vested.
+    pub fn claim_vested(ctx: Context<CreatorEscrow>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let l = &mut ctx.accounts.launch;
+        require!(l.settled, FairError::NotSettled);
+        require!(!l.cancelled, FairError::LaunchCancelled);
+        let unlocked = math::vested(l.creator_tokens, l.vest_start, l.vest_secs, now);
+        let amount = unlocked.saturating_sub(l.creator_claimed);
+        require!(amount > 0, FairError::NothingToClaim);
+        launch_signer!(l, signer);
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer { from: ctx.accounts.escrow.to_account_info(), to: ctx.accounts.creator_ata.to_account_info(), authority: l.to_account_info() },
+                signer,
+            ),
+            amount,
+        )?;
+        l.creator_claimed += amount;
+        emit!(CreatorVested { launch: l.key(), amount, total_claimed: l.creator_claimed });
+        Ok(())
+    }
+
+    /// Cancelled launch: the creator's opening buy is undone (minus its fee).
+    pub fn refund_creator(ctx: Context<CreatorEscrow>) -> Result<()> {
+        let l = &mut ctx.accounts.launch;
+        require!(l.cancelled, FairError::NotCancelled);
+        let tokens = l.creator_tokens;
+        let sol = l.creator_buy_sol;
+        require!(tokens > 0 || sol > 0, FairError::NothingToClaim);
+        launch_signer!(l, signer);
+        if tokens > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer { from: ctx.accounts.escrow.to_account_info(), to: ctx.accounts.vault.to_account_info(), authority: l.to_account_info() },
+                    signer,
+                ),
+                tokens,
+            )?;
+        }
+        l.real_sol = l.real_sol.checked_sub(sol).ok_or(FairError::Overflow)?;
+        pay_from_pda(&l.to_account_info(), &ctx.accounts.creator.to_account_info(), sol)?;
+        l.creator_tokens = 0;
+        l.creator_buy_sol = 0;
+        emit!(CreatorRefunded { launch: l.key(), sol, tokens_returned: tokens });
+        Ok(())
+    }
+
+    pub fn buy(ctx: Context<TradeCtx>, lamports_in: u64, min_tokens_out: u64) -> Result<()> {
+        require!(lamports_in > 0, FairError::ZeroAmount);
+        let slot = Clock::get()?.slot;
+        let cfg = &ctx.accounts.config;
+        require_keys_eq!(ctx.accounts.treasury.key(), cfg.treasury, FairError::WrongTreasury);
+        let l = &mut ctx.accounts.launch;
+        require!(l.settled, FairError::NotSettled);
+        require!(!l.cancelled, FairError::LaunchCancelled);
+        require!(!l.complete && !l.graduated, FairError::CurveComplete);
+
+        let fee_bps = fee_now(cfg, l, slot);
+        let gross_fee = math::fee_amount(lamports_in, fee_bps).fx()?;
+        let q = math::quote_buy(l.virtual_sol, l.virtual_token, l.real_token, lamports_in - gross_fee).fx()?;
+        let fee = if q.completes_curve { math::fee_amount(q.sol_used, fee_bps).fx()? } else { gross_fee };
+        require!(q.tokens_out >= min_tokens_out, FairError::Slippage);
+
+        let system = ctx.accounts.system_program.to_account_info();
+        let user = ctx.accounts.user.to_account_info();
+        pay_from_user(&system, &user, &l.to_account_info(), q.sol_used)?;
+        let to_holders = route_fee(cfg, l, fee, fee_bps, Some((&system, &user)), &ctx.accounts.treasury.to_account_info())?;
+        launch_signer!(l, signer);
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer { from: ctx.accounts.vault.to_account_info(), to: ctx.accounts.user_ata.to_account_info(), authority: l.to_account_info() },
+                signer,
+            ),
+            q.tokens_out,
+        )?;
+        l.virtual_sol += q.sol_used;
+        l.virtual_token -= q.tokens_out;
+        l.real_sol += q.sol_used;
+        l.real_token -= q.tokens_out;
+        if q.completes_curve {
+            l.complete = true;
+        }
+        emit!(state::Trade {
+            launch: l.key(), user: user.key(), is_buy: true, sol_amount: q.sol_used, token_amount: q.tokens_out,
+            fee, fee_bps, to_holders, virtual_sol: l.virtual_sol, virtual_token: l.virtual_token,
+        });
+        Ok(())
+    }
+
+    pub fn sell(ctx: Context<TradeCtx>, tokens_in: u64, min_lamports_out: u64) -> Result<()> {
+        let slot = Clock::get()?.slot;
+        let cfg = &ctx.accounts.config;
+        require_keys_eq!(ctx.accounts.treasury.key(), cfg.treasury, FairError::WrongTreasury);
+        let l = &mut ctx.accounts.launch;
+        require!(l.settled, FairError::NotSettled);
+        require!(!l.cancelled, FairError::LaunchCancelled);
+        require!(!l.complete && !l.graduated, FairError::CurveComplete);
+
+        let gross = math::quote_sell(l.virtual_sol, l.virtual_token, tokens_in).fx()?.min(l.real_sol);
+        let fee_bps = fee_now(cfg, l, slot);
+        let fee = math::fee_amount(gross, fee_bps).fx()?;
+        let out = gross.checked_sub(fee).ok_or(FairError::Overflow)?;
+        require!(out >= min_lamports_out, FairError::Slippage);
+
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer { from: ctx.accounts.user_ata.to_account_info(), to: ctx.accounts.vault.to_account_info(), authority: ctx.accounts.user.to_account_info() },
+            ),
+            tokens_in,
+        )?;
+        l.virtual_sol -= gross;
+        l.virtual_token += tokens_in;
+        l.real_sol -= gross;
+        l.real_token += tokens_in;
+        // The fee stays in the launch account first, then is routed.
+        pay_from_pda(&l.to_account_info(), &ctx.accounts.user.to_account_info(), out)?;
+        let to_holders = route_fee(cfg, l, fee, fee_bps, None, &ctx.accounts.treasury.to_account_info())?;
+        emit!(state::Trade {
+            launch: l.key(), user: ctx.accounts.user.key(), is_buy: false, sol_amount: out, token_amount: tokens_in,
+            fee, fee_bps, to_holders, virtual_sol: l.virtual_sol, virtual_token: l.virtual_token,
+        });
+        Ok(())
+    }
+
+    /// Hold-streak payout. The distributor computes each holder's share off-chain
+    /// and pushes SOL from this launch's reward pool. Every recipient must be passed
+    /// as (token account, wallet) and must currently hold the coin.
+    ///
+    /// The program limits what the distributor key can do even if it is stolen:
+    /// epochs are at least `min_reward_epoch_secs` apart, an epoch can pay out at most
+    /// the pool as it stood when the epoch started, and nobody can receive more than
+    /// MAX_STREAK_MULT times their share of circulating supply.
+    pub fn distribute_rewards<'info>(ctx: Context<'_, '_, 'info, 'info, Distribute<'info>>, epoch: u32, amounts: Vec<u64>) -> Result<()> {
+        let cfg = &ctx.accounts.config;
+        require!(cfg.distributor != Pubkey::default(), FairError::NotDistributor);
+        require_keys_eq!(ctx.accounts.distributor.key(), cfg.distributor, FairError::NotDistributor);
+        let now = Clock::get()?.unix_timestamp;
+        let l = &mut ctx.accounts.launch;
+        require!(l.settled && !l.cancelled, FairError::NotSettled);
+        let rem = ctx.remaining_accounts;
+        require!(!amounts.is_empty() && rem.len() == amounts.len() * 2, FairError::BadRewardAccount);
+        let total: u64 = amounts.iter().try_fold(0u64, |a, x| a.checked_add(*x)).ok_or(FairError::Overflow)?;
+        require!(total <= l.reward_sol, FairError::RewardOverdraw);
+
+        // Epoch guard.
+        if epoch > l.reward_epochs || l.epoch_started_at == 0 {
+            require!(epoch > l.reward_epochs || (l.reward_epochs == 0 && epoch == 0), FairError::BadEpoch);
+            if l.epoch_started_at != 0 {
+                require!(now >= l.epoch_started_at.checked_add(cfg.min_reward_epoch_secs).ok_or(FairError::Overflow)?, FairError::EpochTooSoon);
+            }
+            l.reward_epochs = epoch;
+            l.epoch_started_at = now;
+            l.epoch_budget = l.reward_sol;
+            l.epoch_paid = 0;
+        } else {
+            require!(epoch == l.reward_epochs, FairError::BadEpoch);
+            require!(now <= l.epoch_started_at.checked_add(EPOCH_BATCH_WINDOW_SECS).ok_or(FairError::Overflow)?, FairError::EpochWindowClosed);
+        }
+        let paid = l.epoch_paid.checked_add(total).ok_or(FairError::Overflow)?;
+        require!(paid <= l.epoch_budget, FairError::EpochBudgetExceeded);
+
+        // Circulating supply: everything not held by the curve vault, the creator
+        // escrow or the Raydium pool.
+        let mut locked = (ctx.accounts.vault.amount as u128) + (ctx.accounts.escrow.amount as u128);
+        if l.graduated {
+            let pv = ctx.accounts.pool_token_vault.as_ref().ok_or(FairError::WrongPoolAccount)?;
+            require_keys_eq!(pv.key(), raydium::vault(&cfg.cpmm_program, &l.pool, &l.mint), FairError::WrongPoolAccount);
+            locked += token_amount(&pv.to_account_info())? as u128;
+        }
+        let circulating = (ctx.accounts.mint.supply as u128).saturating_sub(locked);
+        require!(circulating > 0, FairError::BadRewardAccount);
+        let budget = l.epoch_budget as u128;
+
+        let launch_info = l.to_account_info();
+        for (i, amount) in amounts.iter().enumerate() {
+            let token_acc = &rem[i * 2];
+            let wallet = &rem[i * 2 + 1];
+            require_keys_eq!(*token_acc.owner, token::ID, FairError::BadRewardAccount);
+            require!(wallet.key() != launch_info.key(), FairError::BadRewardAccount);
+            let data = token_acc.try_borrow_data()?;
+            let ta = spl_token::state::Account::unpack_from_slice(&data).map_err(|_| error!(FairError::BadRewardAccount))?;
+            drop(data);
+            require!(ta.mint == l.mint && ta.owner == wallet.key() && ta.amount > 0, FairError::BadRewardAccount);
+            require!(wallet.is_writable, FairError::BadRewardAccount);
+            // amount / budget <= MAX_STREAK_MULT * balance / circulating
+            require!(
+                (*amount as u128) * circulating <= MAX_STREAK_MULT * (ta.amount as u128) * budget,
+                FairError::RewardAboveShare
+            );
+            pay_from_pda(&launch_info, wallet, *amount)?;
+        }
+        l.epoch_paid = paid;
+        l.reward_sol -= total;
+        l.reward_paid = l.reward_paid.checked_add(total).ok_or(FairError::Overflow)?;
+        emit!(RewardsPaid { launch: l.key(), epoch, recipients: amounts.len() as u32, total, remaining: l.reward_sol });
+        Ok(())
+    }
+
+    /// Permissionless, step 1 of graduation (same transaction as `graduate`):
+    /// pay the graduation fee and move the curve's SOL to the graduation authority.
+    /// Kept separate because lamports moved by hand can't be followed by a CPI in
+    /// the same instruction.
+    pub fn prepare_graduation(ctx: Context<PrepareGraduation>) -> Result<()> {
+        let cfg = &ctx.accounts.config;
+        require_keys_eq!(ctx.accounts.treasury.key(), cfg.treasury, FairError::WrongTreasury);
+        let l = &mut ctx.accounts.launch;
+        require!(l.complete, FairError::NotComplete);
+        require!(!l.graduated && !l.grad_prepared, FairError::AlreadyGraduated);
+        let grad_fee = cfg.graduation_fee.min(l.real_sol);
+        let available = l.real_sol - grad_fee;
+        require!(available > GRAD_OVERHEAD + MIN_POOL_SOL, FairError::GraduationUnderfunded);
+        pay_from_pda(&l.to_account_info(), &ctx.accounts.treasury.to_account_info(), grad_fee)?;
+        pay_from_pda(&l.to_account_info(), &ctx.accounts.grad_auth.to_account_info(), available)?;
+        l.real_sol = 0;
+        l.grad_pool_sol = available - GRAD_OVERHEAD;
+        l.grad_fee_paid = grad_fee;
+        l.grad_prepared = true;
+        Ok(())
+    }
+
+    /// Permissionless, step 2: create the Raydium CPMM pool.
+    pub fn graduate(ctx: Context<Graduate>) -> Result<()> {
+        let cfg = &ctx.accounts.config;
+        let a = &ctx.accounts;
+        require_keys_eq!(a.treasury.key(), cfg.treasury, FairError::WrongTreasury);
+        {
+            let l = &a.launch;
+            require!(l.grad_prepared, FairError::NotComplete);
+            require!(!l.graduated, FairError::AlreadyGraduated);
+        }
+        let launch_key = a.launch.key();
+        let mint_key = a.mint.key();
+        let cpmm = cfg.cpmm_program;
+        let wsol = spl_token::native_mint::ID;
+        let (mint0, mint1, token_is_1) = raydium::sorted(mint_key, wsol);
+        // The pool lives at a fresh keypair address (it signs this transaction), never
+        // at Raydium's predictable PDA, so nobody can create the pool first and block
+        // graduation.
+        let pool = a.pool_state.key();
+        require!(pool != raydium::pool_state(&cpmm, &cfg.amm_config, &mint0, &mint1), FairError::WrongPoolAccount);
+        require_keys_eq!(a.ray_authority.key(), raydium::authority(&cpmm), FairError::WrongPoolAccount);
+        require_keys_eq!(a.lp_mint.key(), raydium::lp_mint(&cpmm, &pool), FairError::WrongPoolAccount);
+        require_keys_eq!(a.token_0_vault.key(), raydium::vault(&cpmm, &pool, &mint0), FairError::WrongPoolAccount);
+        require_keys_eq!(a.token_1_vault.key(), raydium::vault(&cpmm, &pool, &mint1), FairError::WrongPoolAccount);
+        require_keys_eq!(a.observation.key(), raydium::observation(&cpmm, &pool), FairError::WrongPoolAccount);
+        let grad = a.grad_auth.key();
+        require_keys_eq!(a.grad_wsol.key(), associated_token::get_associated_token_address(&grad, &wsol), FairError::WrongPoolAccount);
+        require_keys_eq!(a.grad_token.key(), associated_token::get_associated_token_address(&grad, &mint_key), FairError::WrongPoolAccount);
+        require_keys_eq!(a.grad_lp.key(), associated_token::get_associated_token_address(&grad, &a.lp_mint.key()), FairError::WrongPoolAccount);
+
+        let grad_bump = a.launch.grad_bump;
+        grad_signer!(launch_key, grad_bump, gsig);
+        let system = a.system_program.to_account_info();
+        let token_prog = a.token_program.to_account_info();
+
+        // 1. SOL is already with the graduation authority (prepare_graduation).
+        let lp_reserve = a.launch.lp_reserve;
+        let pool_sol = a.launch.grad_pool_sol;
+        let grad_fee = a.launch.grad_fee_paid;
+
+        // 2. Token accounts for the graduation authority.
+        for (ata, m) in [(a.grad_wsol.to_account_info(), a.wsol_mint.to_account_info()), (a.grad_token.to_account_info(), a.mint.to_account_info())] {
+            associated_token::create_idempotent(CpiContext::new_with_signer(
+                a.associated_token_program.to_account_info(),
+                associated_token::Create {
+                    payer: a.grad_auth.to_account_info(),
+                    associated_token: ata,
+                    authority: a.grad_auth.to_account_info(),
+                    mint: m,
+                    system_program: system.clone(),
+                    token_program: token_prog.clone(),
+                },
+                gsig,
+            ))?;
+        }
+        // 3. Wrap the pool's SOL.
+        pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.grad_wsol.to_account_info(), pool_sol, gsig)?;
+        token::sync_native(CpiContext::new(token_prog.clone(), token::SyncNative { account: a.grad_wsol.to_account_info() }))?;
+        // 4. Move the LP reserve out of the vault.
+        {
+            let l = &a.launch;
+            launch_signer!(l, lsig);
+            token::transfer(
+                CpiContext::new_with_signer(
+                    token_prog.clone(),
+                    Transfer { from: a.vault.to_account_info(), to: a.grad_token.to_account_info(), authority: l.to_account_info() },
+                    lsig,
+                ),
+                lp_reserve,
+            )?;
+        }
+        // 5. Create the Raydium pool.
+        let (amt0, amt1, ct0, ct1) = if token_is_1 {
+            (pool_sol, lp_reserve, a.grad_wsol.key(), a.grad_token.key())
+        } else {
+            (lp_reserve, pool_sol, a.grad_token.key(), a.grad_wsol.key())
+        };
+        let keys = raydium::InitializeKeys {
+            program: cpmm,
+            creator: grad,
+            amm_config: cfg.amm_config,
+            authority: a.ray_authority.key(),
+            pool_state: pool,
+            token_0_mint: mint0,
+            token_1_mint: mint1,
+            lp_mint: a.lp_mint.key(),
+            creator_token_0: ct0,
+            creator_token_1: ct1,
+            creator_lp_token: a.grad_lp.key(),
+            token_0_vault: a.token_0_vault.key(),
+            token_1_vault: a.token_1_vault.key(),
+            create_pool_fee: a.create_pool_fee.key(),
+            observation_state: a.observation.key(),
+            token_program: token::ID,
+            associated_token_program: AssociatedToken::id(),
+            system_program: system_program::ID,
+            rent: anchor_lang::solana_program::sysvar::rent::ID,
+        };
+        let (m0_info, m1_info) = if token_is_1 { (a.wsol_mint.to_account_info(), a.mint.to_account_info()) } else { (a.mint.to_account_info(), a.wsol_mint.to_account_info()) };
+        let (c0_info, c1_info) = if token_is_1 { (a.grad_wsol.to_account_info(), a.grad_token.to_account_info()) } else { (a.grad_token.to_account_info(), a.grad_wsol.to_account_info()) };
+        invoke_signed(
+            &raydium::initialize_ix(&keys, amt0, amt1, 0),
+            &[
+                a.grad_auth.to_account_info(), a.amm_config.to_account_info(), a.ray_authority.to_account_info(),
+                a.pool_state.to_account_info(), m0_info, m1_info, a.lp_mint.to_account_info(), c0_info, c1_info,
+                a.grad_lp.to_account_info(), a.token_0_vault.to_account_info(), a.token_1_vault.to_account_info(),
+                a.create_pool_fee.to_account_info(), a.observation.to_account_info(), token_prog.clone(),
+                a.associated_token_program.to_account_info(), system.clone(), a.rent.to_account_info(), a.cpmm_program.to_account_info(),
+            ],
+            gsig,
+        )?;
+        // 6. The LP tokens stay with the graduation authority until `lock_liquidity`
+        //    hands them to Raydium's locker (no instruction here can move them anywhere else).
+        // 7. Leftover overhead (unused rent budget) to treasury; keep a float for fee collection.
+        let left = a.grad_auth.lamports().saturating_sub(GRAD_AUTH_FLOAT);
+        pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.treasury.to_account_info(), left, gsig)?;
+
+        let l = &mut ctx.accounts.launch;
+        l.graduated = true;
+        l.pool = pool;
+        l.graduated_slot = Clock::get()?.slot;
+        emit!(Graduated { launch: launch_key, pool, sol_to_pool: pool_sol, tokens_to_pool: lp_reserve, graduation_fee: grad_fee });
+        Ok(())
+    }
+
+    /// Permissionless, step 3 (second transaction): lock all LP with Raydium's
+    /// locker. The liquidity can never be withdrawn; the fee-key NFT goes to the
+    /// graduation authority so only this program can collect the pool fees.
+    pub fn lock_liquidity(ctx: Context<LockLiquidity>) -> Result<()> {
+        let cfg = &ctx.accounts.config;
+        let a = &ctx.accounts;
+        require!(a.launch.graduated, FairError::NotGraduated);
+        require!(!a.launch.lp_locked, FairError::AlreadyGraduated);
+        require_keys_eq!(a.pool_state.key(), a.launch.pool, FairError::WrongPoolAccount);
+        let lockp = cfg.lock_program;
+        let cpmm = cfg.cpmm_program;
+        let pool = a.launch.pool;
+        let grad = a.grad_auth.key();
+        let lp_mint = raydium::lp_mint(&cpmm, &pool);
+        let (mint0, mint1, _) = raydium::sorted(a.launch.mint, spl_token::native_mint::ID);
+        require_keys_eq!(a.lp_mint.key(), lp_mint, FairError::WrongPoolAccount);
+        require_keys_eq!(a.grad_lp.key(), associated_token::get_associated_token_address(&grad, &lp_mint), FairError::WrongPoolAccount);
+        require_keys_eq!(a.token_0_vault.key(), raydium::vault(&cpmm, &pool, &mint0), FairError::WrongPoolAccount);
+        require_keys_eq!(a.token_1_vault.key(), raydium::vault(&cpmm, &pool, &mint1), FairError::WrongPoolAccount);
+        require_keys_eq!(a.lock_authority.key(), raydium::lock::authority(&lockp), FairError::WrongPoolAccount);
+        require_keys_eq!(a.locked_liquidity.key(), raydium::lock::locked_liquidity(&lockp, &a.fee_nft_mint.key()), FairError::WrongPoolAccount);
+        require_keys_eq!(a.locked_lp_vault.key(), associated_token::get_associated_token_address(&a.lock_authority.key(), &lp_mint), FairError::WrongPoolAccount);
+        require_keys_eq!(a.fee_nft_account.key(), associated_token::get_associated_token_address(&grad, &a.fee_nft_mint.key()), FairError::WrongPoolAccount);
+
+        let lp_amount = token_amount(&a.grad_lp.to_account_info())?;
+        let launch_key = a.launch.key();
+        let grad_bump = a.launch.grad_bump;
+        grad_signer!(launch_key, grad_bump, gsig);
+        let keys = raydium::lock::LockKeys {
+            program: lockp,
+            authority: a.lock_authority.key(),
+            payer: a.payer.key(),
+            liquidity_owner: grad,
+            fee_nft_owner: grad,
+            fee_nft_mint: a.fee_nft_mint.key(),
+            fee_nft_account: a.fee_nft_account.key(),
+            pool_state: pool,
+            locked_liquidity: a.locked_liquidity.key(),
+            lp_mint,
+            liquidity_owner_lp: a.grad_lp.key(),
+            locked_lp_vault: a.locked_lp_vault.key(),
+            token_0_vault: a.token_0_vault.key(),
+            token_1_vault: a.token_1_vault.key(),
+            metadata_account: a.nft_metadata.key(),
+            metadata_program: a.metadata_program.key(),
+        };
+        invoke_signed(
+            &raydium::lock::lock_cp_liquidity_ix(&keys, lp_amount),
+            &[
+                a.lock_authority.to_account_info(), a.payer.to_account_info(), a.grad_auth.to_account_info(),
+                a.fee_nft_mint.to_account_info(), a.fee_nft_account.to_account_info(), a.pool_state.to_account_info(),
+                a.locked_liquidity.to_account_info(), a.lp_mint.to_account_info(), a.grad_lp.to_account_info(),
+                a.locked_lp_vault.to_account_info(), a.token_0_vault.to_account_info(), a.token_1_vault.to_account_info(),
+                a.nft_metadata.to_account_info(), a.rent.to_account_info(), a.system_program.to_account_info(),
+                a.token_program.to_account_info(), a.associated_token_program.to_account_info(),
+                a.metadata_program.to_account_info(), a.lock_program.to_account_info(),
+            ],
+            gsig,
+        )?;
+        let fee_nft_mint = a.fee_nft_mint.key();
+        let l = &mut ctx.accounts.launch;
+        l.lp_locked = true;
+        l.fee_nft_mint = fee_nft_mint;
+        emit!(LiquidityLocked { launch: launch_key, pool, lp_amount, fee_nft_mint });
+        Ok(())
+    }
+
+    /// Permissionless. Collect the locked LP's trading fees through the fee key:
+    /// SOL is split between treasury, creator and the holder pool; the coin side is burned.
+    pub fn collect_pool_fees(ctx: Context<CollectPoolFees>) -> Result<()> {
+        let cfg = &ctx.accounts.config;
+        let a = &ctx.accounts;
+        require_keys_eq!(a.treasury.key(), cfg.treasury, FairError::WrongTreasury);
+        require!(a.launch.lp_locked, FairError::NotGraduated);
+        require_keys_eq!(a.pool_state.key(), a.launch.pool, FairError::WrongPoolAccount);
+        require_keys_eq!(a.creator.key(), a.launch.creator, FairError::NotCreator);
+        let cpmm = cfg.cpmm_program;
+        let lockp = cfg.lock_program;
+        let wsol = spl_token::native_mint::ID;
+        let mint_key = a.mint.key();
+        let (mint0, mint1, token_is_1) = raydium::sorted(mint_key, wsol);
+        let pool = a.launch.pool;
+        let grad = a.grad_auth.key();
+        let lp_mint = raydium::lp_mint(&cpmm, &pool);
+        let nft = a.launch.fee_nft_mint;
+        require_keys_eq!(a.lp_mint.key(), lp_mint, FairError::WrongPoolAccount);
+        require_keys_eq!(a.token_0_vault.key(), raydium::vault(&cpmm, &pool, &mint0), FairError::WrongPoolAccount);
+        require_keys_eq!(a.token_1_vault.key(), raydium::vault(&cpmm, &pool, &mint1), FairError::WrongPoolAccount);
+        require_keys_eq!(a.grad_wsol.key(), associated_token::get_associated_token_address(&grad, &wsol), FairError::WrongPoolAccount);
+        require_keys_eq!(a.grad_token.key(), associated_token::get_associated_token_address(&grad, &mint_key), FairError::WrongPoolAccount);
+        require_keys_eq!(a.lock_authority.key(), raydium::lock::authority(&lockp), FairError::WrongPoolAccount);
+        require_keys_eq!(a.locked_liquidity.key(), raydium::lock::locked_liquidity(&lockp, &nft), FairError::WrongPoolAccount);
+        require_keys_eq!(a.fee_nft_account.key(), associated_token::get_associated_token_address(&grad, &nft), FairError::WrongPoolAccount);
+        require_keys_eq!(a.locked_lp_vault.key(), associated_token::get_associated_token_address(&a.lock_authority.key(), &lp_mint), FairError::WrongPoolAccount);
+
+        let launch_key = a.launch.key();
+        let grad_bump = a.launch.grad_bump;
+        grad_signer!(launch_key, grad_bump, gsig);
+        let system = a.system_program.to_account_info();
+        let token_prog = a.token_program.to_account_info();
+
+        // Recipient accounts (the WSOL one is closed after every collection).
+        for (ata, m) in [(a.grad_wsol.to_account_info(), a.wsol_mint.to_account_info()), (a.grad_token.to_account_info(), a.mint.to_account_info())] {
+            associated_token::create_idempotent(CpiContext::new(
+                a.associated_token_program.to_account_info(),
+                associated_token::Create {
+                    payer: a.payer.to_account_info(),
+                    associated_token: ata,
+                    authority: a.grad_auth.to_account_info(),
+                    mint: m,
+                    system_program: system.clone(),
+                    token_program: token_prog.clone(),
+                },
+            ))?;
+        }
+        let (r0, r1) = if token_is_1 { (a.grad_wsol.key(), a.grad_token.key()) } else { (a.grad_token.key(), a.grad_wsol.key()) };
+        let keys = raydium::lock::CollectKeys {
+            program: lockp,
+            authority: a.lock_authority.key(),
+            fee_nft_owner: grad,
+            fee_nft_account: a.fee_nft_account.key(),
+            locked_liquidity: a.locked_liquidity.key(),
+            cpmm_program: cpmm,
+            cp_authority: raydium::authority(&cpmm),
+            pool_state: pool,
+            lp_mint,
+            recipient_token_0: r0,
+            recipient_token_1: r1,
+            token_0_vault: a.token_0_vault.key(),
+            token_1_vault: a.token_1_vault.key(),
+            vault_0_mint: mint0,
+            vault_1_mint: mint1,
+            locked_lp_vault: a.locked_lp_vault.key(),
+        };
+        let (m0_info, m1_info) = if token_is_1 { (a.wsol_mint.to_account_info(), a.mint.to_account_info()) } else { (a.mint.to_account_info(), a.wsol_mint.to_account_info()) };
+        let (r0_info, r1_info) = if token_is_1 { (a.grad_wsol.to_account_info(), a.grad_token.to_account_info()) } else { (a.grad_token.to_account_info(), a.grad_wsol.to_account_info()) };
+        invoke_signed(
+            &raydium::lock::collect_cp_fees_ix(&keys),
+            &[
+                a.lock_authority.to_account_info(), a.grad_auth.to_account_info(), a.fee_nft_account.to_account_info(),
+                a.locked_liquidity.to_account_info(), a.cpmm_program.to_account_info(), a.ray_authority.to_account_info(),
+                a.pool_state.to_account_info(), a.lp_mint.to_account_info(), r0_info, r1_info,
+                a.token_0_vault.to_account_info(), a.token_1_vault.to_account_info(), m0_info, m1_info,
+                a.locked_lp_vault.to_account_info(), token_prog.clone(), a.token_2022_program.to_account_info(),
+                a.memo_program.to_account_info(), a.lock_program.to_account_info(),
+            ],
+            gsig,
+        )?;
+
+        // SOL side: unwrap by closing the WSOL account into the graduation authority.
+        let sol = token_amount(&a.grad_wsol.to_account_info())?;
+        token::close_account(CpiContext::new_with_signer(
+            token_prog.clone(),
+            token::CloseAccount { account: a.grad_wsol.to_account_info(), destination: a.grad_auth.to_account_info(), authority: a.grad_auth.to_account_info() },
+            gsig,
+        ))?;
+        let (to_creator, to_holders, to_treasury) = math::split3(sol, cfg.pool_fee_creator_bps, cfg.pool_fee_holders_bps);
+        pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.creator.to_account_info(), to_creator, gsig)?;
+        pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.launch.to_account_info(), to_holders, gsig)?;
+        pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.treasury.to_account_info(), to_treasury, gsig)?;
+
+        // Coin side: burn it.
+        let burned = token_amount(&a.grad_token.to_account_info())?;
+        if burned > 0 {
+            token::burn(
+                CpiContext::new_with_signer(
+                    token_prog,
+                    token::Burn { mint: a.mint.to_account_info(), from: a.grad_token.to_account_info(), authority: a.grad_auth.to_account_info() },
+                    gsig,
+                ),
+                burned,
+            )?;
+        }
+        let l = &mut ctx.accounts.launch;
+        l.reward_sol = l.reward_sol.checked_add(to_holders).ok_or(FairError::Overflow)?;
+        l.pool_fees_collected = l.pool_fees_collected.checked_add(sol).ok_or(FairError::Overflow)?;
+        emit!(PoolFeesCollected { launch: launch_key, sol, to_treasury, to_creator, to_holders, tokens_burned: burned });
+        Ok(())
+    }
+}
+
+// ───────────────────────────── accounts ─────────────────────────────
+
+#[derive(Accounts)]
+pub struct InitConfig<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(init, payer = authority, space = 8 + Config::INIT_SPACE, seeds = [CONFIG_SEED], bump)]
+    pub config: Box<Account<'info, Config>>,
+    /// Only the program's upgrade authority can initialise the config, so nobody
+    /// can grab a freshly deployed program first.
+    #[account(constraint = program.programdata_address()? == Some(program_data.key()) @ FairError::InvalidConfig)]
+    pub program: Program<'info, crate::program::Fairlaunch>,
+    #[account(constraint = program_data.upgrade_authority_address == Some(authority.key()) @ FairError::InvalidConfig)]
+    pub program_data: Account<'info, ProgramData>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AdminConfig<'info> {
+    pub authority: Signer<'info>,
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump, has_one = authority)]
+    pub config: Box<Account<'info, Config>>,
+}
+
+#[derive(Accounts)]
+pub struct ApplyConfig<'info> {
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+}
+
+#[derive(Accounts)]
+pub struct AcceptAuthority<'info> {
+    pub new_authority: Signer<'info>,
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+}
+
+#[derive(Accounts)]
+#[instruction(seed: [u8; SEED_LEN])]
+pub struct CreateLaunch<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    /// CHECK: validated against config.treasury
+    #[account(mut)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(init, payer = creator, seeds = [MINT_SEED, seed.as_ref()], bump, mint::decimals = DECIMALS, mint::authority = launch)]
+    pub mint: Box<Account<'info, Mint>>,
+    #[account(init, payer = creator, space = 8 + Launch::INIT_SPACE, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump)]
+    pub launch: Box<Account<'info, Launch>>,
+    #[account(init, payer = creator, associated_token::mint = mint, associated_token::authority = launch)]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    #[account(init, payer = creator, seeds = [ESCROW_SEED, launch.key().as_ref()], bump, token::mint = mint, token::authority = launch)]
+    pub escrow: Box<Account<'info, TokenAccount>>,
+    /// CHECK: created by Metaplex (it checks the PDA)
+    #[account(mut)]
+    pub metadata: UncheckedAccount<'info>,
+    pub metadata_program: Program<'info, Metadata>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct Commit<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [LAUNCH_SEED, launch.mint.as_ref()], bump = launch.bump)]
+    pub launch: Box<Account<'info, Launch>>,
+    #[account(init_if_needed, payer = user, space = 8 + Commitment::INIT_SPACE, seeds = [COMMIT_SEED, launch.key().as_ref(), user.key().as_ref()], bump)]
+    pub commitment: Box<Account<'info, Commitment>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Settle<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    /// CHECK: validated against config.treasury
+    #[account(mut)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(mut, seeds = [LAUNCH_SEED, launch.mint.as_ref()], bump = launch.bump)]
+    pub launch: Box<Account<'info, Launch>>,
+}
+
+#[derive(Accounts)]
+pub struct Claim<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
+    pub launch: Box<Account<'info, Launch>>,
+    pub mint: Box<Account<'info, Mint>>,
+    #[account(mut, close = user, seeds = [COMMIT_SEED, launch.key().as_ref(), user.key().as_ref()], bump = commitment.bump, constraint = commitment.owner == user.key())]
+    pub commitment: Box<Account<'info, Commitment>>,
+    #[account(mut, associated_token::mint = mint, associated_token::authority = launch)]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    #[account(init_if_needed, payer = user, associated_token::mint = mint, associated_token::authority = user)]
+    pub user_ata: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CreatorEscrow<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+    #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint, has_one = creator)]
+    pub launch: Box<Account<'info, Launch>>,
+    pub mint: Box<Account<'info, Mint>>,
+    #[account(mut, seeds = [ESCROW_SEED, launch.key().as_ref()], bump)]
+    pub escrow: Box<Account<'info, TokenAccount>>,
+    #[account(mut, associated_token::mint = mint, associated_token::authority = launch)]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    #[account(init_if_needed, payer = creator, associated_token::mint = mint, associated_token::authority = creator)]
+    pub creator_ata: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct TradeCtx<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    /// CHECK: validated against config.treasury
+    #[account(mut)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
+    pub launch: Box<Account<'info, Launch>>,
+    pub mint: Box<Account<'info, Mint>>,
+    #[account(mut, associated_token::mint = mint, associated_token::authority = launch)]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    #[account(init_if_needed, payer = user, associated_token::mint = mint, associated_token::authority = user)]
+    pub user_ata: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Distribute<'info> {
+    pub distributor: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
+    pub launch: Box<Account<'info, Launch>>,
+    pub mint: Box<Account<'info, Mint>>,
+    #[account(associated_token::mint = mint, associated_token::authority = launch)]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    #[account(seeds = [ESCROW_SEED, launch.key().as_ref()], bump)]
+    pub escrow: Box<Account<'info, TokenAccount>>,
+    /// CHECK: the pool's token vault after graduation (checked in the handler); None before.
+    pub pool_token_vault: Option<UncheckedAccount<'info>>,
+}
+
+#[derive(Accounts)]
+pub struct PrepareGraduation<'info> {
+    pub payer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    /// CHECK: validated against config.treasury
+    #[account(mut)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(mut, seeds = [LAUNCH_SEED, launch.mint.as_ref()], bump = launch.bump)]
+    pub launch: Box<Account<'info, Launch>>,
+    /// CHECK: graduation authority PDA (plain system account)
+    #[account(mut, seeds = [GRAD_SEED, launch.key().as_ref()], bump = launch.grad_bump)]
+    pub grad_auth: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Graduate<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    /// CHECK: validated against config.treasury
+    #[account(mut)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
+    pub launch: Box<Account<'info, Launch>>,
+    pub mint: Box<Account<'info, Mint>>,
+    #[account(mut, associated_token::mint = mint, associated_token::authority = launch)]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    /// CHECK: system-owned PDA that creates the pool and owns its fee accounts
+    #[account(mut, seeds = [GRAD_SEED, launch.key().as_ref()], bump = launch.grad_bump)]
+    pub grad_auth: UncheckedAccount<'info>,
+    /// CHECK: ATA(grad_auth, WSOL), checked in the handler
+    #[account(mut)]
+    pub grad_wsol: UncheckedAccount<'info>,
+    /// CHECK: ATA(grad_auth, mint), checked in the handler
+    #[account(mut)]
+    pub grad_token: UncheckedAccount<'info>,
+    /// CHECK: ATA(grad_auth, lp_mint), created by Raydium, checked in the handler
+    #[account(mut)]
+    pub grad_lp: UncheckedAccount<'info>,
+    /// CHECK: native mint
+    #[account(address = spl_token::native_mint::ID)]
+    pub wsol_mint: UncheckedAccount<'info>,
+    /// CHECK: must match config
+    #[account(executable, address = config.cpmm_program)]
+    pub cpmm_program: UncheckedAccount<'info>,
+    /// CHECK: must match config
+    #[account(address = config.amm_config)]
+    pub amm_config: UncheckedAccount<'info>,
+    /// CHECK: Raydium authority PDA, checked in the handler
+    pub ray_authority: UncheckedAccount<'info>,
+    /// Fresh keypair for the Raydium pool account (signs; Raydium creates it).
+    #[account(mut)]
+    pub pool_state: Signer<'info>,
+    /// CHECK: Raydium LP mint PDA, checked in the handler
+    #[account(mut)]
+    pub lp_mint: UncheckedAccount<'info>,
+    /// CHECK: Raydium vault PDA, checked in the handler
+    #[account(mut)]
+    pub token_0_vault: UncheckedAccount<'info>,
+    /// CHECK: Raydium vault PDA, checked in the handler
+    #[account(mut)]
+    pub token_1_vault: UncheckedAccount<'info>,
+    /// CHECK: Raydium's fee receiver, checked by Raydium
+    #[account(mut)]
+    pub create_pool_fee: UncheckedAccount<'info>,
+    /// CHECK: Raydium observation PDA, checked in the handler
+    #[account(mut)]
+    pub observation: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct LockLiquidity<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [LAUNCH_SEED, launch.mint.as_ref()], bump = launch.bump)]
+    pub launch: Box<Account<'info, Launch>>,
+    /// CHECK: graduation authority PDA
+    #[account(mut, seeds = [GRAD_SEED, launch.key().as_ref()], bump = launch.grad_bump)]
+    pub grad_auth: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub grad_lp: UncheckedAccount<'info>,
+    /// New keypair for the fee-key NFT mint (signs the transaction).
+    #[account(mut)]
+    pub fee_nft_mint: Signer<'info>,
+    /// CHECK: ATA(grad_auth, fee_nft_mint), created by the locker
+    #[account(mut)]
+    pub fee_nft_account: UncheckedAccount<'info>,
+    /// CHECK: the NFT's metadata PDA (no metadata is written)
+    #[account(mut)]
+    pub nft_metadata: UncheckedAccount<'info>,
+    /// CHECK: must match config
+    #[account(executable, address = config.lock_program)]
+    pub lock_program: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    pub lock_authority: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub locked_liquidity: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub locked_lp_vault: UncheckedAccount<'info>,
+    /// CHECK: must equal launch.pool
+    pub pool_state: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub lp_mint: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub token_0_vault: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub token_1_vault: UncheckedAccount<'info>,
+    pub metadata_program: Program<'info, Metadata>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct CollectPoolFees<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    /// CHECK: validated against config.treasury
+    #[account(mut)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
+    pub launch: Box<Account<'info, Launch>>,
+    /// CHECK: must be launch.creator, receives the creator share
+    #[account(mut)]
+    pub creator: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub mint: Box<Account<'info, Mint>>,
+    /// CHECK: graduation authority PDA
+    #[account(mut, seeds = [GRAD_SEED, launch.key().as_ref()], bump = launch.grad_bump)]
+    pub grad_auth: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub grad_wsol: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub grad_token: UncheckedAccount<'info>,
+    /// CHECK: native mint
+    #[account(address = spl_token::native_mint::ID)]
+    pub wsol_mint: UncheckedAccount<'info>,
+    /// CHECK: must match config
+    #[account(executable, address = config.cpmm_program)]
+    pub cpmm_program: UncheckedAccount<'info>,
+    /// CHECK: Raydium authority; the locker checks it
+    pub ray_authority: UncheckedAccount<'info>,
+    /// CHECK: must equal launch.pool
+    #[account(mut)]
+    pub pool_state: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub lp_mint: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub token_0_vault: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub token_1_vault: UncheckedAccount<'info>,
+    /// CHECK: must match config
+    #[account(executable, address = config.lock_program)]
+    pub lock_program: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    pub lock_authority: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub locked_liquidity: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    pub fee_nft_account: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub locked_lp_vault: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 program id
+    #[account(address = raydium::lock::TOKEN_2022)]
+    pub token_2022_program: UncheckedAccount<'info>,
+    /// CHECK: memo program id
+    #[account(address = raydium::lock::MEMO_PROGRAM)]
+    pub memo_program: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}

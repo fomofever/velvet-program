@@ -1,0 +1,9 @@
+[workspace]
+members = ["programs/*"]
+exclude = ["tests-litesvm"]
+resolver = "2"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
