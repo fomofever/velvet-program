@@ -11,7 +11,8 @@
 //!   5. Trading opens with a fee that decays from 50% to 1%. Part of every fee, and
 //!      most of the cover-charge premium, goes to a holder reward pool paid out by
 //!      hold streak.
-//!   6. While bonding, no curve buy can take a wallet above 3% of the supply.
+//!   6. While bonding, no curve buy can take a wallet above 3% of the supply, and no
+//!      wallet's line commit (or the creator's opening buy) can buy more than 3% either.
 //!   7. When the curve fills, anyone can graduate it into a Raydium CPMM pool. All LP
 //!      is locked in Raydium's locker; its trading fees go to the treasury, the
 //!      creator and holders, and a quarter of the treasury's part goes back into the
@@ -458,6 +459,8 @@ pub mod fairlaunch {
         if creator_buy_lamports > 0 {
             let fee = math::fee_amount(creator_buy_lamports, cfg.base_fee_bps).fx()?;
             let q = math::quote_buy(l.virtual_sol, l.virtual_token, l.real_token, creator_buy_lamports - fee).fx()?;
+            // The creator's bag counts against the same 3% cap as everyone else.
+            require!(q.tokens_out <= MAX_WALLET_TOKENS_BONDING, FairError::WalletCapExceeded);
             let system = ctx.accounts.system_program.to_account_info();
             let creator = ctx.accounts.creator.to_account_info();
             pay_from_user(&system, &creator, &l.to_account_info(), q.sol_used)?;
@@ -565,6 +568,15 @@ pub mod fairlaunch {
         }
         let new_amount = c.amount.checked_add(lamports).ok_or(FairError::Overflow)?;
         require!(new_amount <= ctx.accounts.config.per_wallet_commit_cap, FairError::CommitCapExceeded);
+        // 3% cap for the line too: what this wallet's whole commit would buy if it were alone in
+        // the line, at the price before the line, must fit under the cap (minus the creator's own
+        // bag, for the creator). A fuller line only raises the price, so the real share is smaller.
+        {
+            let fee = math::fee_amount(new_amount, ctx.accounts.config.base_fee_bps).fx()?;
+            let q = math::quote_buy(l.virtual_sol, l.virtual_token, l.real_token, new_amount - fee).fx()?;
+            let own = if c.owner == l.creator { l.creator_tokens } else { 0 };
+            require!(q.tokens_out.saturating_add(own) <= MAX_WALLET_TOKENS_BONDING, FairError::WalletCapExceeded);
+        }
         pay_from_user(&ctx.accounts.system_program.to_account_info(), &ctx.accounts.user.to_account_info(), &l.to_account_info(), lamports)?;
         c.amount = new_amount;
         l.total_committed = l.total_committed.checked_add(lamports).ok_or(FairError::Overflow)?;

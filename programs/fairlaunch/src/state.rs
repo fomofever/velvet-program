@@ -41,7 +41,8 @@ pub const MIN_REWARD_EPOCH_SECS: i64 = 60;
 pub const MAX_TIMELOCK_SECS: i64 = 30 * 86_400;
 
 /// While a coin is on the bonding curve, a curve buy can't take a wallet above this
-/// share of the supply (3%). Line claims, transfers and Raydium trades aren't limited.
+/// share of the supply (3%). Line commits and the creator's opening buy are held to the same
+/// cap when they are made; transfers and Raydium trades aren't limited.
 pub const MAX_WALLET_BPS_BONDING: u64 = 300;
 pub const MAX_WALLET_TOKENS_BONDING: u64 = TOTAL_SUPPLY / 10_000 * MAX_WALLET_BPS_BONDING;
 /// Share of Velvet's cut of Raydium pool fees that goes back into the pool as

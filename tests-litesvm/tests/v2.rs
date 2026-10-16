@@ -25,6 +25,11 @@ const SOL: u64 = 1_000_000_000;
 const AUCTION: u64 = 40;
 const DECAY: u64 = 150;
 const CAP: u64 = 5 * SOL;
+const CT70: u64 = 700_000_000_000_000;
+const VT70: u64 = 1_225_000_000_000_000;
+const V70: u64 = 75 * SOL;
+/// Most a wallet can commit to a fresh 70/30 line under the 3% cap (≈1.90 SOL).
+const LINE_MAX: u64 = 1_900_000_000;
 
 fn pid() -> Pubkey { fairlaunch::ID }
 fn cpmm() -> Pubkey { Pubkey::from_str("DRaycpLY18LhpbydsBWbVJtxpNv9oXPgjRSfpF2bWpYb").unwrap() }
@@ -77,9 +82,10 @@ fn params(env_treasury: Pubkey, distributor: Pubkey) -> ConfigParams {
         max_min_raise: 85 * SOL,
         max_vest_secs: 30 * 86_400,
         graduation_fee: SOL,
-        virtual_sol: INITIAL_VIRTUAL_SOL,
-        virtual_tokens: INITIAL_VIRTUAL_TOKENS,
-        curve_tokens: CURVE_REAL_TOKENS,
+        // Mainnet's 70/30 curve: 700M on the curve, bonds at 100 SOL.
+        virtual_sol: V70,
+        virtual_tokens: VT70,
+        curve_tokens: CT70,
         min_reward_epoch_secs: 3_000,
     }
 }
@@ -283,6 +289,29 @@ fn distribute_epoch(env: &mut Env, l: &L, signer: &Keypair, epoch: u32, pays: &[
 
 fn seed(n: u8) -> [u8; 16] { let mut s = [7u8; 16]; s[0] = n; s }
 
+/// Would a wallet with `total` lamports in this line (plus `own` tokens already, for the creator)
+/// stay under the 3% cap? Mirrors the program's check: the whole commit bought alone at the
+/// pre-line price.
+fn line_fits(s: &Launch, total: u64, own: u64) -> bool {
+    let fee = fairlaunch::math::fee_amount(total, 100).unwrap();
+    let q = fairlaunch::math::quote_buy(s.virtual_sol, s.virtual_token, s.real_token, total - fee).unwrap();
+    q.tokens_out + own <= MAX_WALLET_TOKENS_BONDING
+}
+/// The most one (non-creator) wallet can commit to this line.
+fn line_max(env: &Env, l: &L) -> u64 {
+    let s = launch_state(&env.svm, &l.launch);
+    let (mut lo, mut hi) = (0u64, CAP);
+    while lo < hi { let mid = (lo + hi + 1) / 2; if line_fits(&s, mid, 0) { lo = mid } else { hi = mid - 1 } }
+    lo
+}
+/// `n` fresh wallets, each committing the most it may.
+fn fill_line(env: &mut Env, l: &L, n: usize) -> Vec<Keypair> {
+    let amt = line_max(env, l);
+    let ws: Vec<Keypair> = (0..n).map(|_| user(&mut env.svm, 10)).collect();
+    for w in &ws { commit(env, l, w, amt).unwrap(); }
+    ws
+}
+
 // ───────────────────────────── tests ─────────────────────────────
 
 #[test]
@@ -335,9 +364,9 @@ fn fair_line_fee_split_and_flipper_funds_holders() {
     let start = slot(&env.svm);
     let early = user(&mut env.svm, 20);
     let late = user(&mut env.svm, 20);
-    commit(&mut env, &l, &early, 2 * SOL).unwrap();
+    commit(&mut env, &l, &early, 3 * SOL / 2).unwrap();
     advance(&mut env.svm, AUCTION - 2, 15);
-    commit(&mut env, &l, &late, 2 * SOL).unwrap();
+    commit(&mut env, &l, &late, 3 * SOL / 2).unwrap();
     advance(&mut env.svm, 2, 1);
     let t0 = bal(&env.svm, &env.treasury);
     settle(&mut env, &l, &early).unwrap();
@@ -345,9 +374,9 @@ fn fair_line_fee_split_and_flipper_funds_holders() {
     claim(&mut env, &l, &late).unwrap();
     assert_eq!(tok(&env.svm, &ata(&early.pubkey(), &l.mint)), tok(&env.svm, &ata(&late.pubkey(), &l.mint)));
     let s = launch_state(&env.svm, &l.launch);
-    // settle fee 1% of 4 SOL: 0.01 to holders, 0.03 to treasury
-    assert_eq!(s.reward_sol, 4 * SOL / 100 / 4);
-    assert_eq!(bal(&env.svm, &env.treasury) - t0, 4 * SOL / 100 * 3 / 4);
+    // settle fee 1% of 3 SOL: a quarter to holders, the rest to the treasury
+    assert_eq!(s.reward_sol, 3 * SOL / 100 / 4);
+    assert_eq!(bal(&env.svm, &env.treasury) - t0, 3 * SOL / 100 - 3 * SOL / 100 / 4);
     let _ = start;
 
     // Flipper at 50% cover: premium goes to holders
@@ -392,8 +421,8 @@ fn distributor_pays_holders_only() {
     let l = create(&mut env, &creator, seed(5), 0, 0, 0).unwrap();
     let a = user(&mut env.svm, 20);
     let b = user(&mut env.svm, 20);
-    commit(&mut env, &l, &a, 3 * SOL).unwrap();
-    commit(&mut env, &l, &b, SOL).unwrap();
+    commit(&mut env, &l, &a, 3 * SOL / 2).unwrap();
+    commit(&mut env, &l, &b, SOL / 2).unwrap();
     advance(&mut env.svm, AUCTION, 20);
     settle(&mut env, &l, &a).unwrap();
     claim(&mut env, &l, &a).unwrap();
@@ -546,8 +575,7 @@ fn graduates_into_raydium_burns_lp_and_collects_creator_fees() {
     let l = create(&mut env, &creator, seed(6), SOL, 0, 0).unwrap();
     let e = graduate(&mut env, &l, &creator).unwrap_err();
     assert!(e.contains("NotComplete"), "{e}");
-    let whales: Vec<Keypair> = (0..20).map(|_| user(&mut env.svm, 10)).collect();
-    for w in &whales { commit(&mut env, &l, w, CAP).unwrap(); }
+    let whales = fill_line(&mut env, &l, 60); // ~114 SOL at ≤3% each fills the 100 SOL curve
     advance(&mut env.svm, AUCTION, 20);
     settle(&mut env, &l, &whales[0]).unwrap();
     let s = launch_state(&env.svm, &l.launch);
@@ -774,6 +802,47 @@ fn no_wallet_can_buy_past_three_percent_while_bonding() {
     trade(&mut env, &l, &whale, false, held / 2).unwrap();
 }
 
+/// The 3% cap also holds in the line and for the creator's opening buy: nobody can get more
+/// than 3% of the supply before the coin bonds, even alone in the line.
+#[test]
+fn the_line_and_the_opening_buy_are_held_to_three_percent() {
+    let mut env = setup();
+    // opening buy: 2 SOL at the start price would be ~31.5M tokens (>3%), so it's refused
+    let creator = user(&mut env.svm, 10);
+    let e = match create(&mut env, &creator, seed(50), 2 * SOL, 0, 0) { Err(e) => e, Ok(_) => panic!("2 SOL opening buy was accepted") };
+    assert!(e.contains("WalletCapExceeded"), "{e}");
+    let l = create(&mut env, &creator, seed(50), SOL, 0, 0).unwrap();
+    let own = launch_state(&env.svm, &l.launch).creator_tokens;
+    assert!(own > 0 && own <= MAX_WALLET_TOKENS_BONDING);
+
+    // a lone wallet can commit up to ~1.9 SOL; one lamport more is refused, also in two steps
+    let most = line_max(&env, &l);
+    assert!(most > 17 * SOL / 10 && most < 2 * SOL, "line max {most}");
+    let a = user(&mut env.svm, 10);
+    let e = commit(&mut env, &l, &a, most + 1).unwrap_err();
+    assert!(e.contains("WalletCapExceeded"), "{e}");
+    commit(&mut env, &l, &a, most - SOL / 2).unwrap();
+    let e = commit(&mut env, &l, &a, SOL / 2 + 1).unwrap_err();
+    assert!(e.contains("WalletCapExceeded"), "{e}");
+    commit(&mut env, &l, &a, SOL / 2).unwrap();
+
+    // the creator's bag counts against their own line spot
+    let s = launch_state(&env.svm, &l.launch);
+    let mut room = 0u64;
+    while line_fits(&s, room + SOL / 100, own) { room += SOL / 100; }
+    let e = commit(&mut env, &l, &creator, room + SOL / 100).unwrap_err();
+    assert!(e.contains("WalletCapExceeded"), "{e}");
+    commit(&mut env, &l, &creator, room).unwrap();
+
+    // alone or not, nobody ends up above 3% after the doors open
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &a).unwrap();
+    claim(&mut env, &l, &a).unwrap();
+    claim(&mut env, &l, &creator).unwrap();
+    assert!(tok(&env.svm, &ata(&a.pubkey(), &l.mint)) <= MAX_WALLET_TOKENS_BONDING);
+    assert!(tok(&env.svm, &ata(&creator.pubkey(), &l.mint)) + own <= MAX_WALLET_TOKENS_BONDING);
+}
+
 /// 70/30 curve: 700M tokens on the curve, 300M into the pool. With virtual tokens
 /// VT = C^2 / (C - LP) the pool opens at the curve's last price, so bonding doesn't
 /// jump the price. Pure config: no program change needed.
@@ -788,12 +857,11 @@ fn seventy_thirty_curve_bonds_at_the_curve_price() {
     let l = create(&mut env, &creator, seed(49), 0, 0, 0).unwrap();
     let s = launch_state(&env.svm, &l.launch);
     assert_eq!((s.real_token, s.lp_reserve), (CT, TOTAL_SUPPLY - CT));
-    let ws: Vec<Keypair> = (0..6).map(|_| user(&mut env.svm, 10)).collect();
-    for w in &ws { commit(&mut env, &l, w, CAP).unwrap(); }
+    let ws = fill_line(&mut env, &l, 80);
     advance(&mut env.svm, AUCTION, 20);
     settle(&mut env, &l, &ws[0]).unwrap();
     let s = launch_state(&env.svm, &l.launch);
-    assert!(s.complete, "30 SOL of line fills a 20 SOL curve");
+    assert!(s.complete, "a full line of 3% wallets fills a 20 SOL curve");
     let end_price = s.virtual_sol as f64 / s.virtual_token as f64;
     graduate(&mut env, &l, &ws[1]).unwrap();
     let k = pool_keys(&env, &l);
@@ -900,7 +968,7 @@ fn stolen_distributor_key_cannot_drain_the_holder_pool() {
     let creator = user(&mut env.svm, 10);
     let l = create(&mut env, &creator, seed(21), 0, 0, 0).unwrap();
     let holder = user(&mut env.svm, 20);
-    commit(&mut env, &l, &holder, 4 * SOL).unwrap();
+    commit(&mut env, &l, &holder, LINE_MAX).unwrap();
     advance(&mut env.svm, AUCTION, 20);
     settle(&mut env, &l, &holder).unwrap();
     claim(&mut env, &l, &holder).unwrap();
@@ -948,9 +1016,9 @@ fn someone_creating_the_raydium_pool_first_cannot_block_graduation() {
     let creator = user(&mut env.svm, 10);
     let l = create(&mut env, &creator, seed(22), SOL, 0, 0).unwrap();
     let attacker = user(&mut env.svm, 20);
-    commit(&mut env, &l, &attacker, CAP).unwrap();
-    let whales: Vec<Keypair> = (0..19).map(|_| user(&mut env.svm, 10)).collect();
-    for w in &whales { commit(&mut env, &l, w, CAP).unwrap(); }
+    let most = line_max(&env, &l);
+    commit(&mut env, &l, &attacker, most).unwrap();
+    let whales = fill_line(&mut env, &l, 59);
     advance(&mut env.svm, AUCTION, 20);
     settle(&mut env, &l, &attacker).unwrap();
     claim(&mut env, &l, &attacker).unwrap();
@@ -1052,7 +1120,7 @@ fn run_fuzz(seed: u64, steps: usize) -> (usize, usize, usize) {
         }
         if fl.is_empty() || (op == 0 && fl.len() < 3) {
             let c = rng.below(users.len() as u64) as usize;
-            let buy = [0, SOL / 10, SOL, 2 * SOL][rng.below(4) as usize];
+            let buy = [0, SOL / 10, SOL, 3 * SOL / 2][rng.below(4) as usize];
             let min_raise = [0, 0, 5 * SOL, 60 * SOL][rng.below(4) as usize];
             let vest = [0i64, 600, 86_400][rng.below(3) as usize];
             let mut sd = [0u8; 16]; sd[..8].copy_from_slice(&seed.to_le_bytes()); sd[8] = fl.len() as u8; sd[9] = step as u8; sd[10] = (step >> 8) as u8;
@@ -1075,7 +1143,8 @@ fn run_fuzz(seed: u64, steps: usize) -> (usize, usize, usize) {
                     // commit, sometimes over the cap
                     let amt = if rng.chance(10) { CAP + 1 } else if rng.chance(60) { (rng.below(30) + 20) * SOL / 10 } else { (rng.below(20) + 1) * SOL / 10 };
                     let prev = *fl[i].commits.get(&u).unwrap_or(&0);
-                    let should = !s.settled && now_slot < s.auction_end_slot && prev + amt <= CAP;
+                    let own = if u == fl[i].creator { s.creator_tokens } else { 0 };
+                    let should = !s.settled && now_slot < s.auction_end_slot && prev + amt <= CAP && line_fits(&s, prev + amt, own);
                     match commit(&mut env, &l, &users[u], amt) {
                         Ok(()) => { assert!(should, "[{ctx}] commit accepted when it should fail"); *fl[i].commits.entry(u).or_default() += amt; ok += 1 }
                         Err(e) => { assert!(!should || funds_err(&e), "[{ctx}] commit refused when allowed: {e}"); rejected += 1 }

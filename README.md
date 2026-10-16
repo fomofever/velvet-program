@@ -27,7 +27,8 @@ is exactly this code.
 Every coin is minted by the program with a fixed 1B supply and minting switched off in the same
 transaction. Openings are a single-price batch (the "line"), early flippers pay a decaying cover
 charge that goes to holders, and bonded coins move to a Raydium pool with 100% of the LP locked
-in Raydium's locker. While bonding, no curve buy can take a wallet above 3% of the supply. A
+in Raydium's locker. While bonding, no wallet can get more than 3% of the supply: curve buys, line commits and the
+creator's opening buy are all checked. A
 quarter of Velvet's share of the pool fees goes back into the pool as liquidity whose LP tokens
 are burned. Fee and limit changes wait out an on-chain timelock.
 
