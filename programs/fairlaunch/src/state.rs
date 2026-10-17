@@ -39,6 +39,8 @@ pub const MAX_DECAY_SLOTS: u64 = 3_000;
 pub const MAX_AUCTION_SLOTS: u64 = 3_000;
 pub const MIN_REWARD_EPOCH_SECS: i64 = 60;
 pub const MAX_TIMELOCK_SECS: i64 = 30 * 86_400;
+/// Hard ceiling on the per-coin storage fee (0.001 SOL), so changing it needs no timelock.
+pub const MAX_STORAGE_FEE: u64 = 1_000_000;
 
 /// While a coin is on the bonding curve, a curve buy can't take a wallet above this
 /// share of the supply (3%). Line commits and the creator's opening buy are held to the same
@@ -138,7 +140,12 @@ pub struct Config {
     pub pending_eta: i64,
     /// Two-step authority hand-over (e.g. to a multisig).
     pub pending_authority: Pubkey,
-    pub _reserved: [u8; 64],
+    /// Permanent storage: every new coin pays `storage_fee` lamports to `storage_wallet`, which
+    /// buys the Arweave credits that store its logo and metadata. Default key = off.
+    /// (Carved out of the old 64 reserved bytes, so existing configs read as "off".)
+    pub storage_wallet: Pubkey,
+    pub storage_fee: u64,
+    pub _reserved: [u8; 24],
 }
 
 #[account]
@@ -237,6 +244,12 @@ pub struct Commitment {
 }
 
 // ── events ──
+
+#[event]
+pub struct StorageSet {
+    pub wallet: Pubkey,
+    pub fee: u64,
+}
 
 #[event]
 pub struct LaunchCreated {

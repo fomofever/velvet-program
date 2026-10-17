@@ -45,6 +45,8 @@ struct Env {
     distributor: Keypair,
     treasury: Pubkey,
     config: Pubkey,
+    /// Account passed as the storage wallet on launches (the treasury unless a test sets one).
+    storage: Pubkey,
 }
 
 fn load_fixture(svm: &mut LiteSVM, file: &str) {
@@ -142,7 +144,7 @@ fn setup_with(tweak: impl Fn(&mut ConfigParams)) -> Env {
     let treasury = Keypair::new().pubkey();
     svm.airdrop(&treasury, SOL).unwrap();
     let (config, _) = Pubkey::find_program_address(&[CONFIG_SEED], &pid());
-    let mut env = Env { svm, admin, distributor, treasury, config };
+    let mut env = Env { svm, admin, distributor, treasury, config, storage: treasury };
     let mut p = params(treasury, env.distributor.pubkey());
     tweak(&mut p);
     let ix = init_config_ix(config, &env.admin.pubkey(), p);
@@ -203,7 +205,7 @@ fn create(env: &mut Env, creator: &Keypair, seed: [u8; 16], buy: u64, min_raise:
         accounts: fairlaunch::accounts::CreateLaunch {
             creator: creator.pubkey(), config: env.config, treasury: env.treasury, mint, launch, vault, escrow, metadata,
             metadata_program: mpl(), token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID,
-            system_program: system_program::ID, rent: sysvar::rent::ID,
+            system_program: system_program::ID, rent: sysvar::rent::ID, storage: env.storage,
         }.to_account_metas(None),
         data: fairlaunch::instruction::CreateLaunch {
             seed, name: "Velvet Test".into(), symbol: "VTEST".into(), uri: "https://velvet.example/m/x.json".into(),
@@ -691,6 +693,7 @@ fn free_ixs(env: &Env, f: &Free, signer: &Keypair, creator: Pubkey, payer: &Pubk
             payer: *payer, config: env.config, mint: l.mint, launch: l.launch, vault: l.vault, escrow: l.escrow, metadata,
             instructions: sysvar::instructions::ID, metadata_program: mpl(), token_program: spl_token::ID,
             associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID, rent: sysvar::rent::ID,
+            storage: env.storage,
         }.to_account_metas(None),
         data: fairlaunch::instruction::CreateLaunchSigned {
             seed: f.seed, name: f.name.into(), symbol: FREE_SYM.into(), uri: FREE_URI.into(), auction_slots: f.auction,
@@ -1298,4 +1301,62 @@ fn fuzz_random_sequences_keep_the_books_balanced() {
     let (mut ok, mut rej, mut grad) = (0, 0, 0);
     for s in 0..seeds { let (a, b, c) = run_fuzz(s, steps); ok += a; rej += b; grad += c; }
     println!("fuzz: {seeds} seeds x {steps} steps: {ok} accepted, {rej} correctly refused, {grad} graduations");
+}
+
+// ───────────────────────────── storage fee ─────────────────────────────
+
+fn set_storage_ix(config: Pubkey, wallet: Pubkey, fee: u64, authority: &Pubkey) -> Instruction {
+    admin_ix(config, fairlaunch::instruction::SetStorage { wallet, fee }.data(), authority)
+}
+
+#[test]
+fn every_new_coin_pays_the_storage_fee_to_the_storage_wallet() {
+    let mut env = setup();
+    let admin = env.admin.insecure_clone();
+    let wallet = Keypair::new().pubkey();
+    const FEE: u64 = 100_000;
+    // only the authority, and never above the cap
+    let rando = user(&mut env.svm, 1);
+    assert!(send(&mut env.svm, vec![set_storage_ix(env.config, wallet, FEE, &rando.pubkey())], &rando).is_err());
+    let e = send(&mut env.svm, vec![set_storage_ix(env.config, wallet, MAX_STORAGE_FEE + 1, &admin.pubkey())], &admin).unwrap_err();
+    assert!(e.contains("InvalidConfig"), "{e}");
+    send(&mut env.svm, vec![set_storage_ix(env.config, wallet, FEE, &admin.pubkey())], &admin).unwrap();
+    let c = config_state(&env);
+    assert_eq!((c.storage_wallet, c.storage_fee), (wallet, FEE));
+
+    // An empty wallet can't receive 0.0001 SOL (rent rule): the launch still goes through, fee skipped.
+    env.storage = wallet;
+    let creator = user(&mut env.svm, 5);
+    create(&mut env, &creator, seed(90), 0, 0, 0).expect("launch must not fail over the fee");
+    assert_eq!(bal(&env.svm, &wallet), 0);
+
+    // Funded wallet: instant launch, the creator pays it.
+    env.svm.airdrop(&wallet, 1_000_000).unwrap();
+    create(&mut env, &creator, seed(91), 0, 0, 0).unwrap();
+    assert_eq!(bal(&env.svm, &wallet), 1_000_000 + FEE);
+
+    // Free launch: the first buyer pays it; the creator still pays nothing.
+    let free_creator = Keypair::new();
+    let buyer = user(&mut env.svm, 10);
+    let f = free(92, now(&env.svm) + 86_400);
+    let mut ixs = free_ixs(&env, &f, &free_creator, free_creator.pubkey(), &buyer.pubkey(), None);
+    let l = free_keys(&f.seed);
+    ixs.push(commit_ix(&env, &l, &buyer.pubkey(), SOL));
+    send(&mut env.svm, ixs, &buyer).unwrap();
+    assert_eq!(bal(&env.svm, &wallet), 1_000_000 + 2 * FEE);
+    assert_eq!(bal(&env.svm, &free_creator.pubkey()), 0);
+
+    // Can't dodge it by passing another account as the storage wallet.
+    env.storage = creator.pubkey();
+    let e = create(&mut env, &creator, seed(93), 0, 0, 0).err().expect("wrong wallet must fail");
+    assert!(e.contains("WrongStorageWallet"), "{e}");
+    let f = free(94, now(&env.svm) + 86_400);
+    let ixs = free_ixs(&env, &f, &free_creator, free_creator.pubkey(), &buyer.pubkey(), None);
+    let e = send(&mut env.svm, ixs, &buyer).unwrap_err();
+    assert!(e.contains("WrongStorageWallet"), "{e}");
+
+    // Off again: any account is accepted and nothing is charged.
+    send(&mut env.svm, vec![set_storage_ix(env.config, Pubkey::default(), 0, &admin.pubkey())], &admin).unwrap();
+    create(&mut env, &creator, seed(95), 0, 0, 0).unwrap();
+    assert_eq!(bal(&env.svm, &wallet), 1_000_000 + 2 * FEE);
 }

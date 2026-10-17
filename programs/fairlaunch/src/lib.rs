@@ -338,6 +338,20 @@ struct CoinAccounts<'a, 'info> {
     token_program: &'a AccountInfo<'info>,
 }
 
+/// The per-coin storage fee, paid by whoever pays the coin's rent. Skipped when storage is off,
+/// or when the wallet is so empty that the transfer itself would fail Solana's rent rule
+/// (a launch must never fail over this).
+fn pay_storage_fee<'info>(cfg: &Config, storage: &AccountInfo<'info>, payer: &AccountInfo<'info>, system: &AccountInfo<'info>) -> Result<()> {
+    if cfg.storage_wallet == Pubkey::default() || cfg.storage_fee == 0 { return Ok(()); }
+    require_keys_eq!(storage.key(), cfg.storage_wallet, FairError::WrongStorageWallet);
+    let min = Rent::get()?.minimum_balance(0);
+    if storage.lamports().saturating_add(cfg.storage_fee) < min { return Ok(()); }
+    anchor_lang::system_program::transfer(
+        CpiContext::new(system.clone(), anchor_lang::system_program::Transfer { from: payer.clone(), to: storage.clone() }),
+        cfg.storage_fee,
+    )
+}
+
 #[program]
 pub mod fairlaunch {
     use super::*;
@@ -403,6 +417,17 @@ pub mod fairlaunch {
 
     /// Hand the config to a new authority (e.g. a Squads multisig). Two steps so a
     /// typo can't lose control.
+    /// Set the storage wallet and per-coin fee (default key turns it off). The fee is capped at
+    /// MAX_STORAGE_FEE, so this takes effect immediately.
+    pub fn set_storage(ctx: Context<AdminConfig>, wallet: Pubkey, fee: u64) -> Result<()> {
+        require!(fee <= MAX_STORAGE_FEE, FairError::InvalidConfig);
+        let c = &mut ctx.accounts.config;
+        c.storage_wallet = wallet;
+        c.storage_fee = fee;
+        emit!(StorageSet { wallet, fee });
+        Ok(())
+    }
+
     pub fn transfer_authority(ctx: Context<AdminConfig>, new_authority: Pubkey) -> Result<()> {
         ctx.accounts.config.pending_authority = new_authority;
         Ok(())
@@ -454,6 +479,7 @@ pub mod fairlaunch {
             CoinAccounts { mint: &mint, vault: &vault, metadata: &metadata, metadata_program: &metadata_program, payer: &creator_info, system: &system, rent: &rent, token_program: &token_prog },
             seed, name, symbol, uri, auction_slots, min_raise, vest_secs, bump, mint_bump,
         )?;
+        pay_storage_fee(cfg, &ctx.accounts.storage.to_account_info(), &creator_info, &system)?;
         launch_signer!(l, signer);
 
         if creator_buy_lamports > 0 {
@@ -539,6 +565,7 @@ pub mod fairlaunch {
             CoinAccounts { mint: &mint, vault: &vault, metadata: &metadata, metadata_program: &metadata_program, payer: &payer, system: &system, rent: &rent, token_program: &token_prog },
             seed, name, symbol, uri, auction_slots, min_raise, vest_secs, bump, mint_bump,
         )?;
+        pay_storage_fee(cfg, &ctx.accounts.storage.to_account_info(), &payer, &system)?;
         emit!(LaunchCreated {
             launch: l.key(),
             mint: l.mint,
@@ -1376,6 +1403,9 @@ pub struct CreateLaunch<'info> {
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
+    /// CHECK: checked against config.storage_wallet when storage is on
+    #[account(mut)]
+    pub storage: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -1405,6 +1435,9 @@ pub struct CreateLaunchSigned<'info> {
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
+    /// CHECK: checked against config.storage_wallet when storage is on
+    #[account(mut)]
+    pub storage: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]

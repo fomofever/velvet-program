@@ -84,6 +84,8 @@ pub enum FairError {
     BadApproval,
     #[msg("Launch approval has expired")]
     ApprovalExpired,
+    #[msg("Wrong storage wallet")]
+    WrongStorageWallet,
 }
 
 impl From<MathError> for FairError {

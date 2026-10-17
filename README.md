@@ -17,7 +17,8 @@ is exactly this code.
   launch: the creator's Ed25519 approval is checked on-chain, the first buyer pays the rent), commit, settle, claim,
   claim_vested, refund_creator, buy, sell, distribute_rewards, prepare_graduation, graduate,
   lock_liquidity, collect_pool_fees, plus admin: init_config, propose_config / apply_config /
-  cancel_config (timelocked), disable_distributor, transfer_authority / accept_authority
+  cancel_config (timelocked), disable_distributor, transfer_authority / accept_authority,
+  set_storage (the per-coin permanent-storage fee, capped at 0.001 SOL in code)
 - `math.rs` — bonding curve, fee decay, fee split, vesting (unit tested)
 - `raydium.rs` — CPIs into Raydium CPMM and the Raydium liquidity locker
 - `state.rs`, `errors.rs` — accounts and error codes
