@@ -19,6 +19,8 @@ is exactly this code.
   lock_liquidity, collect_pool_fees, plus admin: init_config, propose_config / apply_config /
   cancel_config (timelocked), disable_distributor, transfer_authority / accept_authority,
   set_storage (the per-coin permanent-storage fee, capped at 0.001 SOL in code)
+- `idl/velvet_launch.json` — the program's interface (Anchor IDL), also published on-chain so
+  explorers decode Velvet instructions
 - `math.rs` — bonding curve, fee decay, fee split, vesting (unit tested)
 - `raydium.rs` — CPIs into Raydium CPMM and the Raydium liquidity locker
 - `state.rs`, `errors.rs` — accounts and error codes
