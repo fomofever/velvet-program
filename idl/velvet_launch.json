@@ -848,6 +848,28 @@
               }
             ]
           }
+        },
+        {
+          "name": "config_ext",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  101,
+                  120,
+                  116
+                ]
+              }
+            ]
+          }
         }
       ],
       "args": []
@@ -1305,6 +1327,142 @@
       "args": []
     },
     {
+      "name": "collect_velvet_fees",
+      "docs": [
+        "Permissionless: collect a Velvet Pools coin's fees (0.15% of every swap, in SOL) and split",
+        "them in three equal parts: the coin's holders (hold-streak pool), its creator, and Velvet."
+      ],
+      "discriminator": [
+        248,
+        142,
+        141,
+        137,
+        160,
+        136,
+        40,
+        59
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "treasury",
+          "writable": true
+        },
+        {
+          "name": "launch",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  97,
+                  117,
+                  110,
+                  99,
+                  104
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint",
+          "relations": [
+            "launch"
+          ]
+        },
+        {
+          "name": "creator",
+          "writable": true
+        },
+        {
+          "name": "grad_auth",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  114,
+                  97,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "launch"
+              }
+            ]
+          }
+        },
+        {
+          "name": "grad_wsol",
+          "writable": true
+        },
+        {
+          "name": "wsol_mint",
+          "address": "So11111111111111111111111111111111111111112"
+        },
+        {
+          "name": "pools_program",
+          "address": "VPkPeiAg7LheTtDdBByCmXewabF9zF6yK5YYLmfPjWb"
+        },
+        {
+          "name": "pool",
+          "writable": true
+        },
+        {
+          "name": "pool_vault_auth"
+        },
+        {
+          "name": "pool_sol_vault",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "commit",
       "docs": [
         "Commit SOL to the opening line."
@@ -1369,6 +1527,9 @@
         },
         {
           "name": "commitment",
+          "docs": [
+            "topped up); the seeds pin it to this launch and user, the handler checks the rest."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -2207,7 +2368,8 @@
     {
       "name": "graduate",
       "docs": [
-        "Permissionless, step 2: create the Raydium CPMM pool."
+        "Permissionless, step 2: create the Raydium CPMM pool (only while new coins still bond",
+        "into Raydium; see `graduate_velvet`)."
       ],
       "discriminator": [
         45,
@@ -2455,6 +2617,282 @@
         {
           "name": "rent",
           "address": "SysvarRent111111111111111111111111111111111"
+        },
+        {
+          "name": "config_ext",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  101,
+                  120,
+                  116
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "graduate_velvet",
+      "docs": [
+        "Permissionless, step 2 when new coins bond into Velvet Pools: create the coin's pool with",
+        "the curve's SOL and the LP reserve. Velvet Pools has no withdraw at all, so the liquidity",
+        "is locked by design (no locker step)."
+      ],
+      "discriminator": [
+        190,
+        227,
+        221,
+        4,
+        239,
+        140,
+        148,
+        254
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "config_ext",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  101,
+                  120,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "treasury",
+          "writable": true
+        },
+        {
+          "name": "launch",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  97,
+                  117,
+                  110,
+                  99,
+                  104
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint",
+          "writable": true,
+          "relations": [
+            "launch"
+          ]
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "launch"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "grad_auth",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  114,
+                  97,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "launch"
+              }
+            ]
+          }
+        },
+        {
+          "name": "grad_wsol",
+          "writable": true
+        },
+        {
+          "name": "grad_token",
+          "writable": true
+        },
+        {
+          "name": "wsol_mint",
+          "address": "So11111111111111111111111111111111111111112"
+        },
+        {
+          "name": "pools_program",
+          "address": "VPkPeiAg7LheTtDdBByCmXewabF9zF6yK5YYLmfPjWb"
+        },
+        {
+          "name": "pool",
+          "writable": true
+        },
+        {
+          "name": "pool_vault_auth"
+        },
+        {
+          "name": "pool_sol_vault",
+          "writable": true
+        },
+        {
+          "name": "pool_token_vault",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": []
@@ -2502,7 +2940,7 @@
             "Only the program's upgrade authority can initialise the config, so nobody",
             "can grab a freshly deployed program first."
           ],
-          "address": "8f9XtMzn9J8vapxoLoypKUjNta64jhjfr18WMVCn5yAk"
+          "address": "B7YjFBeDvKZ7BfEg6YyhKci28F6cAjVn3z5gtorcvJhi"
         },
         {
           "name": "program_data"
@@ -3781,19 +4219,6 @@
   ],
   "accounts": [
     {
-      "name": "Commitment",
-      "discriminator": [
-        61,
-        112,
-        129,
-        128,
-        24,
-        147,
-        77,
-        87
-      ]
-    },
-    {
       "name": "Config",
       "discriminator": [
         155,
@@ -4399,44 +4824,6 @@
       }
     },
     {
-      "name": "Commitment",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "launch",
-            "type": "pubkey"
-          },
-          {
-            "name": "owner",
-            "type": "pubkey"
-          },
-          {
-            "name": "amount",
-            "type": "u64"
-          },
-          {
-            "name": "bump",
-            "type": "u8"
-          },
-          {
-            "name": "claimed",
-            "docs": [
-              "Line tokens already claimed (claims can be partial while a big line unlocks)."
-            ],
-            "type": "u64"
-          },
-          {
-            "name": "refunded",
-            "docs": [
-              "The overfill refund has been paid."
-            ],
-            "type": "bool"
-          }
-        ]
-      }
-    },
-    {
       "name": "Committed",
       "type": {
         "kind": "struct",
@@ -4948,6 +5335,28 @@
             "type": "u32"
           },
           {
+            "name": "velvet_pools",
+            "docs": [
+              "New coins bond into Velvet Pools instead of Raydium."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "pass_min_committers",
+            "docs": [
+              "Velvet Pass: a line only counts in a launch with at least this many wallets in its line",
+              "(0 = PASS_DEFAULT_MIN_COMMITTERS)."
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "pass_min_line_total",
+            "docs": [
+              "...and at least this much SOL in its line in total (0 = PASS_DEFAULT_MIN_LINE_TOTAL)."
+            ],
+            "type": "u64"
+          },
+          {
             "name": "_spare",
             "docs": [
               "Room for later settings without moving the layout."
@@ -4955,7 +5364,7 @@
             "type": {
               "array": [
                 "u8",
-                32
+                21
               ]
             }
           },
@@ -5234,11 +5643,18 @@
             "type": "u32"
           },
           {
+            "name": "pool_kind",
+            "docs": [
+              "Where the coin bonded: 0 = Raydium CPMM, 1 = Velvet Pools."
+            ],
+            "type": "u8"
+          },
+          {
             "name": "_reserved",
             "type": {
               "array": [
                 "u8",
-                58
+                57
               ]
             }
           }
