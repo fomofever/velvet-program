@@ -224,7 +224,13 @@ pub struct Launch {
     pub epoch_started_at: i64,
     pub epoch_budget: u64,
     pub epoch_paid: u64,
-    pub _reserved: [u8; 64],
+    /// Line unlock schedule, fixed at settle (0 secs = everything claimable at once). Big lines
+    /// (see ConfigExt) unlock `line_unlock_bps` at open and the rest linearly over
+    /// `line_vest_secs` from `vest_start`. Carved out of the old 64 reserved bytes, so launches
+    /// settled before read as "no vesting".
+    pub line_unlock_bps: u16,
+    pub line_vest_secs: u32,
+    pub _reserved: [u8; 58],
 }
 
 impl Launch {
@@ -241,9 +247,101 @@ pub struct Commitment {
     pub owner: Pubkey,
     pub amount: u64,
     pub bump: u8,
+    /// Line tokens already claimed (claims can be partial while a big line unlocks).
+    pub claimed: u64,
+    /// The overfill refund has been paid.
+    pub refunded: bool,
 }
 
+/// Size of a commitment created before `claimed`/`refunded` existed (they read as 0/false).
+pub const COMMITMENT_V1_LEN: usize = 8 + 32 + 32 + 8 + 1;
+
+/// Velvet Pass: a wallet's record across every Velvet coin, kept by the program.
+/// Tiers: 0 Guest, 1 Regular (3+ lines), 2 VIP (10+ lines and 5+ SOL put in, no recent flip).
+/// A line counts once, when its tokens are first claimed, if the wallet put in at least
+/// PASS_MIN_LINE_SOL and the launch went ahead. A "flip" is a sell while the cover charge is still
+/// on: it drops the wallet one tier until it has PASS_HEAL_LINES more clean lines.
+#[account]
+#[derive(InitSpace)]
+pub struct Pass {
+    pub owner: Pubkey,
+    pub lines: u32,
+    pub sol_in_lines: u64,
+    pub flips: u32,
+    pub flip_pending: bool,
+    pub clean_since_flip: u16,
+    pub bump: u8,
+    pub _reserved: [u8; 32],
+}
+
+pub const PASS_SEED: &[u8] = b"pass";
+pub const PASS_MIN_LINE_SOL: u64 = 100_000_000;
+pub const PASS_REGULAR_LINES: u32 = 3;
+pub const PASS_VIP_LINES: u32 = 10;
+pub const PASS_VIP_SOL: u64 = 5_000_000_000;
+pub const PASS_HEAL_LINES: u16 = 5;
+/// VIPs pay this share of the cover charge premium (the part above the base fee), in bps.
+pub const PASS_VIP_PREMIUM_BPS: u64 = 5_000;
+
+impl Pass {
+    pub fn tier(&self) -> u8 {
+        let base = if self.lines >= PASS_VIP_LINES && self.sol_in_lines >= PASS_VIP_SOL { 2 } else if self.lines >= PASS_REGULAR_LINES { 1 } else { 0 };
+        if self.flip_pending && base > 0 { base - 1 } else { base }
+    }
+}
+
+#[event]
+pub struct PassUpdated {
+    pub owner: Pubkey,
+    pub lines: u32,
+    pub sol_in_lines: u64,
+    pub flips: u32,
+    pub tier: u8,
+}
+
+/// Extra settings that didn't fit the original Config, behind the same timelock.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, InitSpace, PartialEq, Eq, Debug, Default)]
+pub struct ExtParams {
+    /// A line that puts more than this into the curve unlocks gradually.
+    pub big_line_sol: u64,
+    /// Share of each big-line spot claimable when the doors open (bps).
+    pub big_line_unlock_bps: u16,
+    /// The rest unlocks linearly over this long.
+    pub big_line_vest_secs: u32,
+    /// Room for later settings without moving the layout.
+    pub _spare: [u8; 32],
+    pub _spare2: [u8; 32],
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct ConfigExt {
+    pub bump: u8,
+    pub params: ExtParams,
+    pub pending: ExtParams,
+    pub pending_eta: i64,
+    pub _reserved: [u8; 128],
+}
+
+pub const CONFIG_EXT_SEED: &[u8] = b"config_ext";
+pub const MAX_LINE_VEST_SECS: u32 = 7 * 86_400;
+pub const MIN_LINE_UNLOCK_BPS: u16 = 1_000;
+/// When the line would fill the whole curve while the cover charge is on, it stops this many
+/// tokens short so the curve can only complete (and bond) after the cover charge.
+pub const SETTLE_SLIVER_TOKENS: u64 = 1_000_000;
+
 // ── events ──
+
+#[event]
+pub struct ConfigExtProposed {
+    pub eta: i64,
+    pub params: ExtParams,
+}
+
+#[event]
+pub struct ConfigExtApplied {
+    pub params: ExtParams,
+}
 
 #[event]
 pub struct StorageSet {

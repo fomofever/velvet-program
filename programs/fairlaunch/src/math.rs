@@ -74,7 +74,7 @@ pub fn quote_buy(
 }
 
 /// Lamports needed to take exactly `tokens_out` from the curve (rounded up).
-fn sol_for_exact_tokens(vs: u128, vt: u128, tokens_out: u128) -> R<u128> {
+pub fn sol_for_exact_tokens(vs: u128, vt: u128, tokens_out: u128) -> R<u128> {
     let k = m(vs.checked_mul(vt))?;
     let new_vt = m(vt.checked_sub(tokens_out))?;
     if new_vt == 0 {
@@ -333,5 +333,36 @@ mod tests {
     fn zero_amounts_rejected() {
         assert_eq!(quote_buy(VS, VT, RT, 0), Err(MathError::ZeroAmount));
         assert_eq!(quote_sell(VS, VT, 0), Err(MathError::ZeroAmount));
+    }
+}
+
+/// How much of a line share has unlocked `elapsed` seconds after the doors opened:
+/// `unlock_bps` at once, the rest linearly over `vest_secs` (0 = all at once).
+pub fn line_unlocked(share: u64, unlock_bps: u16, vest_secs: u32, elapsed: i64) -> R<u64> {
+    if vest_secs == 0 || unlock_bps >= 10_000 {
+        return Ok(share);
+    }
+    let share_u = share as u128;
+    let upfront = m(share_u.checked_mul(unlock_bps as u128))? / 10_000;
+    if elapsed <= 0 {
+        return to_u64(upfront);
+    }
+    let e = (elapsed as u128).min(vest_secs as u128);
+    let rest = share_u - upfront;
+    let streamed = m(rest.checked_mul(e))? / (vest_secs as u128);
+    to_u64(upfront + streamed)
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+    #[test]
+    fn unlock_schedule() {
+        assert_eq!(line_unlocked(1000, 2500, 3600, 0).unwrap(), 250);
+        assert_eq!(line_unlocked(1000, 2500, 3600, 1800).unwrap(), 625);
+        assert_eq!(line_unlocked(1000, 2500, 3600, 3600).unwrap(), 1000);
+        assert_eq!(line_unlocked(1000, 2500, 3600, 99999).unwrap(), 1000);
+        assert_eq!(line_unlocked(1000, 2500, 0, 0).unwrap(), 1000);
+        assert_eq!(line_unlocked(1000, 2500, 3600, -5).unwrap(), 250);
     }
 }

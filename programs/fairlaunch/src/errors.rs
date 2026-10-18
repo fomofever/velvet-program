@@ -86,6 +86,10 @@ pub enum FairError {
     ApprovalExpired,
     #[msg("Wrong storage wallet")]
     WrongStorageWallet,
+    #[msg("The curve can't be completed while the cover charge is still on: buy a little less, or wait a minute")]
+    CurveFillTooEarly,
+    #[msg("Bad commitment account")]
+    BadCommitment,
 }
 
 impl From<MathError> for FairError {

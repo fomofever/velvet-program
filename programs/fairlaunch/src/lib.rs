@@ -181,6 +181,82 @@ fn token_amount(acc: &AccountInfo) -> Result<u64> {
 
 use anchor_lang::solana_program::program_pack::Pack;
 
+/// Read a commitment of either layout (before/after `claimed` and `refunded` were added).
+fn read_commitment(info: &AccountInfo) -> Result<Commitment> {
+    require!(info.owner == &crate::ID, FairError::BadCommitment);
+    let data = info.try_borrow_data()?;
+    require!(data.len() >= COMMITMENT_V1_LEN && data[..8] == *Commitment::DISCRIMINATOR, FairError::BadCommitment);
+    let mut b = &data[8..];
+    let launch = Pubkey::deserialize(&mut b)?;
+    let owner = Pubkey::deserialize(&mut b)?;
+    let amount = u64::deserialize(&mut b)?;
+    let bump = u8::deserialize(&mut b)?;
+    let (claimed, refunded) = if data.len() >= 8 + Commitment::INIT_SPACE { (u64::deserialize(&mut b)?, bool::deserialize(&mut b)?) } else { (0, false) };
+    Ok(Commitment { launch, owner, amount, bump, claimed, refunded })
+}
+
+/// Write a commitment back in the current layout, growing an old one first (the user pays the
+/// few lamports of extra rent).
+fn write_commitment<'info>(info: &AccountInfo<'info>, c: &Commitment, payer: &AccountInfo<'info>, system: &AccountInfo<'info>) -> Result<()> {
+    let need = 8 + Commitment::INIT_SPACE;
+    if info.data_len() < need {
+        let rent = Rent::get()?.minimum_balance(need).saturating_sub(info.lamports());
+        if rent > 0 {
+            anchor_lang::system_program::transfer(
+                CpiContext::new(system.clone(), anchor_lang::system_program::Transfer { from: payer.clone(), to: info.clone() }),
+                rent,
+            )?;
+        }
+        info.realloc(need, false)?;
+    }
+    let mut data = info.try_borrow_mut_data()?;
+    let mut out: &mut [u8] = &mut data[8..];
+    c.serialize(&mut out)?;
+    Ok(())
+}
+
+/// Close a program-owned account, sending its lamports to `to`.
+fn close_account<'info>(info: &AccountInfo<'info>, to: &AccountInfo<'info>) -> Result<()> {
+    let lamports = info.lamports();
+    **to.try_borrow_mut_lamports()? = to.lamports().checked_add(lamports).ok_or(FairError::Overflow)?;
+    **info.try_borrow_mut_lamports()? = 0;
+    info.assign(&anchor_lang::solana_program::system_program::ID);
+    info.realloc(0, false)?;
+    Ok(())
+}
+
+/// While the cover charge is still above the base fee, nothing may complete the curve: the coin
+/// can only bond (and leave the cover charge behind) after it.
+fn in_cover_window(cfg: &Config, l: &Launch, slot: u64) -> bool {
+    cfg.decay_slots > 0 && slot < l.trading_start_slot.saturating_add(cfg.decay_slots)
+}
+
+/// Fill in a freshly created Pass (init_if_needed leaves it zeroed).
+fn touch_pass(p: &mut Pass, owner: Pubkey, bump: u8) {
+    if p.owner == Pubkey::default() { p.owner = owner; p.bump = bump; }
+}
+
+/// The cover charge a wallet pays right now: VIPs pay half of the premium above the base fee.
+fn fee_for(cfg: &Config, l: &Launch, slot: u64, pass: &Pass) -> u16 {
+    let f = fee_now(cfg, l, slot);
+    if pass.tier() >= 2 && f > cfg.base_fee_bps {
+        let premium = (f - cfg.base_fee_bps) as u64;
+        cfg.base_fee_bps + (premium * PASS_VIP_PREMIUM_BPS / 10_000) as u16
+    } else {
+        f
+    }
+}
+
+impl ExtParams {
+    pub fn validate(&self) -> Result<()> {
+        require!(
+            (MIN_LINE_UNLOCK_BPS..=10_000).contains(&self.big_line_unlock_bps) && self.big_line_vest_secs <= MAX_LINE_VEST_SECS,
+            FairError::InvalidConfig
+        );
+        Ok(())
+    }
+}
+
 /// What a creator's launch approval commits to. Anyone holding a valid signature
 /// over this can deploy exactly this coin, and only once (the mint address comes
 /// from the seed).
@@ -428,6 +504,46 @@ pub mod fairlaunch {
         Ok(())
     }
 
+    /// Create the extra settings account (once). Its values then change only through the timelock.
+    pub fn init_config_ext(ctx: Context<InitConfigExt>, params: ExtParams) -> Result<()> {
+        params.validate()?;
+        let e = &mut ctx.accounts.config_ext;
+        e.bump = ctx.bumps.config_ext;
+        e.params = params;
+        Ok(())
+    }
+
+    pub fn propose_config_ext(ctx: Context<AdminConfigExt>, params: ExtParams) -> Result<()> {
+        params.validate()?;
+        let eta = Clock::get()?.unix_timestamp.checked_add(ctx.accounts.config.timelock_secs).ok_or(FairError::Overflow)?.max(1);
+        let e = &mut ctx.accounts.config_ext;
+        e.pending = params.clone();
+        e.pending_eta = eta;
+        emit!(ConfigExtProposed { eta, params });
+        Ok(())
+    }
+
+    /// Anyone can apply the queued extra settings once the timelock has passed.
+    pub fn apply_config_ext(ctx: Context<ApplyConfigExt>) -> Result<()> {
+        let e = &mut ctx.accounts.config_ext;
+        require!(e.pending_eta != 0, FairError::NoPendingChange);
+        require!(Clock::get()?.unix_timestamp >= e.pending_eta, FairError::TimelockNotReady);
+        let p = e.pending.clone();
+        p.validate()?;
+        e.params = p.clone();
+        e.pending = ExtParams::default();
+        e.pending_eta = 0;
+        emit!(ConfigExtApplied { params: p });
+        Ok(())
+    }
+
+    pub fn cancel_config_ext(ctx: Context<AdminConfigExt>) -> Result<()> {
+        let e = &mut ctx.accounts.config_ext;
+        e.pending = ExtParams::default();
+        e.pending_eta = 0;
+        Ok(())
+    }
+
     pub fn transfer_authority(ctx: Context<AdminConfig>, new_authority: Pubkey) -> Result<()> {
         ctx.accounts.config.pending_authority = new_authority;
         Ok(())
@@ -633,8 +749,23 @@ pub mod fairlaunch {
             l.cancelled = true;
         } else if total > 0 {
             let gross_fee = math::fee_amount(total, cfg.base_fee_bps).fx()?;
-            let q = math::quote_buy(l.virtual_sol, l.virtual_token, l.real_token, total - gross_fee).fx()?;
-            fee = if q.completes_curve { math::fee_amount(q.sol_used, cfg.base_fee_bps).fx()? } else { gross_fee };
+            let mut q = math::quote_buy(l.virtual_sol, l.virtual_token, l.real_token, total - gross_fee).fx()?;
+            // A line big enough to fill the whole curve stops just short of it while the cover
+            // charge is on; the unused SOL is refunded to the line like any overfill.
+            if q.completes_curve && in_cover_window(cfg, l, clock.slot) && l.real_token > SETTLE_SLIVER_TOKENS {
+                let tokens_out = l.real_token - SETTLE_SLIVER_TOKENS;
+                let sol = math::sol_for_exact_tokens(l.virtual_sol as u128, l.virtual_token as u128, tokens_out as u128).fx()?;
+                q = math::BuyQuote { tokens_out, sol_used: u64::try_from(sol).map_err(|_| error!(FairError::Overflow))?.min(total - gross_fee), completes_curve: false };
+                fee = math::fee_amount(q.sol_used, cfg.base_fee_bps).fx()?;
+            } else {
+                fee = if q.completes_curve { math::fee_amount(q.sol_used, cfg.base_fee_bps).fx()? } else { gross_fee };
+            }
+            // Big lines unlock gradually so a full line can't dump the moment the doors open.
+            let ext = &ctx.accounts.config_ext.params;
+            if ext.big_line_vest_secs > 0 && q.sol_used > ext.big_line_sol {
+                l.line_unlock_bps = ext.big_line_unlock_bps;
+                l.line_vest_secs = ext.big_line_vest_secs;
+            }
             let refund = total - q.sol_used - fee;
             l.virtual_sol += q.sol_used;
             l.virtual_token -= q.tokens_out;
@@ -666,8 +797,11 @@ pub mod fairlaunch {
     pub fn claim(ctx: Context<Claim>) -> Result<()> {
         let l = &mut ctx.accounts.launch;
         require!(l.settled, FairError::NotSettled);
-        let amt = ctx.accounts.commitment.amount;
-        let (tokens, refund) = if l.cancelled {
+        let info = ctx.accounts.commitment.to_account_info();
+        let mut c = read_commitment(&info)?;
+        require!(c.owner == ctx.accounts.user.key() && c.launch == l.key(), FairError::BadCommitment);
+        let amt = c.amount;
+        let (share, refund_total) = if l.cancelled {
             (0, amt)
         } else {
             (
@@ -675,6 +809,11 @@ pub mod fairlaunch {
                 math::pro_rata(l.batch_refund, amt, l.total_committed).fx()?,
             )
         };
+        let now = Clock::get()?.unix_timestamp;
+        let unlocked = math::line_unlocked(share, l.line_unlock_bps, l.line_vest_secs, now.saturating_sub(l.vest_start)).fx()?;
+        let tokens = unlocked.saturating_sub(c.claimed);
+        let refund = if c.refunded { 0 } else { refund_total };
+        require!(tokens > 0 || refund > 0 || share == 0, FairError::NothingToClaim);
         if tokens > 0 {
             launch_signer!(l, signer);
             token::transfer(
@@ -690,6 +829,27 @@ pub mod fairlaunch {
         if refund > 0 {
             l.escrow_sol = l.escrow_sol.checked_sub(refund).ok_or(FairError::Overflow)?;
             pay_from_pda(&l.to_account_info(), &ctx.accounts.user.to_account_info(), refund)?;
+        }
+        // Velvet Pass: a line counts once, on its first claim, if it went ahead and the wallet put
+        // in enough.
+        let first = c.claimed == 0 && !c.refunded;
+        touch_pass(&mut ctx.accounts.pass, ctx.accounts.user.key(), ctx.bumps.pass);
+        if first && !l.cancelled && share > 0 && amt.saturating_sub(refund_total) >= PASS_MIN_LINE_SOL {
+            let p = &mut ctx.accounts.pass;
+            p.lines = p.lines.saturating_add(1);
+            p.sol_in_lines = p.sol_in_lines.saturating_add(amt.saturating_sub(refund_total));
+            if p.flip_pending {
+                p.clean_since_flip = p.clean_since_flip.saturating_add(1);
+                if p.clean_since_flip >= PASS_HEAL_LINES { p.flip_pending = false; }
+            }
+            emit!(PassUpdated { owner: p.owner, lines: p.lines, sol_in_lines: p.sol_in_lines, flips: p.flips, tier: p.tier() });
+        }
+        c.claimed = c.claimed.checked_add(tokens).ok_or(FairError::Overflow)?;
+        c.refunded = true;
+        if c.claimed >= share {
+            close_account(&info, &ctx.accounts.user.to_account_info())?;
+        } else {
+            write_commitment(&info, &c, &ctx.accounts.user.to_account_info(), &ctx.accounts.system_program.to_account_info())?;
         }
         emit!(Claimed { launch: l.key(), user: ctx.accounts.user.key(), tokens, refund });
         Ok(())
@@ -754,10 +914,12 @@ pub mod fairlaunch {
         require!(!l.cancelled, FairError::LaunchCancelled);
         require!(!l.complete && !l.graduated, FairError::CurveComplete);
 
-        let fee_bps = fee_now(cfg, l, slot);
+        touch_pass(&mut ctx.accounts.pass, ctx.accounts.user.key(), ctx.bumps.pass);
+        let fee_bps = fee_for(cfg, l, slot, &ctx.accounts.pass);
         let gross_fee = math::fee_amount(lamports_in, fee_bps).fx()?;
         let q = math::quote_buy(l.virtual_sol, l.virtual_token, l.real_token, lamports_in - gross_fee).fx()?;
         let fee = if q.completes_curve { math::fee_amount(q.sol_used, fee_bps).fx()? } else { gross_fee };
+        require!(!(q.completes_curve && in_cover_window(cfg, l, slot)), FairError::CurveFillTooEarly);
         require!(q.tokens_out >= min_tokens_out, FairError::Slippage);
         // Anti-whale while bonding: no curve buy may take a wallet above 3% of supply. Tokens the
         // wallet is still owed count too: an unclaimed line share and, for the creator, the bag
@@ -765,8 +927,8 @@ pub mod fairlaunch {
         let pending_line = {
             let info = ctx.accounts.commitment.to_account_info();
             if info.owner == &crate::ID && !info.data_is_empty() && !l.cancelled && l.total_committed > 0 {
-                let c = Commitment::try_deserialize(&mut &info.data.borrow()[..])?;
-                math::pro_rata(l.batch_tokens, c.amount, l.total_committed).fx()?
+                let c = read_commitment(&info)?;
+                math::pro_rata(l.batch_tokens, c.amount, l.total_committed).fx()?.saturating_sub(c.claimed)
             } else {
                 0
             }
@@ -815,7 +977,16 @@ pub mod fairlaunch {
         require!(!l.complete && !l.graduated, FairError::CurveComplete);
 
         let gross = math::quote_sell(l.virtual_sol, l.virtual_token, tokens_in).fx()?.min(l.real_sol);
-        let fee_bps = fee_now(cfg, l, slot);
+        touch_pass(&mut ctx.accounts.pass, ctx.accounts.user.key(), ctx.bumps.pass);
+        let fee_bps = fee_for(cfg, l, slot, &ctx.accounts.pass);
+        // Selling while the cover charge is on is a flip: it costs a tier until it heals.
+        if fee_now(cfg, l, slot) > cfg.base_fee_bps {
+            let p = &mut ctx.accounts.pass;
+            p.flips = p.flips.saturating_add(1);
+            p.flip_pending = true;
+            p.clean_since_flip = 0;
+            emit!(PassUpdated { owner: p.owner, lines: p.lines, sol_in_lines: p.sol_in_lines, flips: p.flips, tier: p.tier() });
+        }
         let fee = math::fee_amount(gross, fee_bps).fx()?;
         let out = gross.checked_sub(fee).ok_or(FairError::Overflow)?;
         require!(out >= min_lamports_out, FairError::Slippage);
@@ -1462,6 +1633,34 @@ pub struct Settle<'info> {
     pub treasury: UncheckedAccount<'info>,
     #[account(mut, seeds = [LAUNCH_SEED, launch.mint.as_ref()], bump = launch.bump)]
     pub launch: Box<Account<'info, Launch>>,
+    #[account(seeds = [CONFIG_EXT_SEED], bump = config_ext.bump)]
+    pub config_ext: Box<Account<'info, ConfigExt>>,
+}
+
+#[derive(Accounts)]
+pub struct InitConfigExt<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = authority)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(init, payer = authority, space = 8 + ConfigExt::INIT_SPACE, seeds = [CONFIG_EXT_SEED], bump)]
+    pub config_ext: Box<Account<'info, ConfigExt>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AdminConfigExt<'info> {
+    pub authority: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = authority)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [CONFIG_EXT_SEED], bump = config_ext.bump)]
+    pub config_ext: Box<Account<'info, ConfigExt>>,
+}
+
+#[derive(Accounts)]
+pub struct ApplyConfigExt<'info> {
+    #[account(mut, seeds = [CONFIG_EXT_SEED], bump = config_ext.bump)]
+    pub config_ext: Box<Account<'info, ConfigExt>>,
 }
 
 #[derive(Accounts)]
@@ -1471,8 +1670,10 @@ pub struct Claim<'info> {
     #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
     pub launch: Box<Account<'info, Launch>>,
     pub mint: Box<Account<'info, Mint>>,
-    #[account(mut, close = user, seeds = [COMMIT_SEED, launch.key().as_ref(), user.key().as_ref()], bump = commitment.bump, constraint = commitment.owner == user.key())]
-    pub commitment: Box<Account<'info, Commitment>>,
+    /// CHECK: read by hand so commitments from before partial claims still work; the seeds pin it
+    /// to this launch and user, and the handler checks owner, discriminator and fields.
+    #[account(mut, seeds = [COMMIT_SEED, launch.key().as_ref(), user.key().as_ref()], bump)]
+    pub commitment: UncheckedAccount<'info>,
     #[account(mut, associated_token::mint = mint, associated_token::authority = launch)]
     pub vault: Box<Account<'info, TokenAccount>>,
     #[account(init_if_needed, payer = user, associated_token::mint = mint, associated_token::authority = user)]
@@ -1480,6 +1681,8 @@ pub struct Claim<'info> {
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
+    #[account(init_if_needed, payer = user, space = 8 + Pass::INIT_SPACE, seeds = [PASS_SEED, user.key().as_ref()], bump)]
+    pub pass: Box<Account<'info, Pass>>,
 }
 
 #[derive(Accounts)]
@@ -1523,6 +1726,8 @@ pub struct TradeCtx<'info> {
     /// the seeds; buys count any unclaimed line tokens in it toward the 3% cap.
     #[account(seeds = [COMMIT_SEED, launch.key().as_ref(), user.key().as_ref()], bump)]
     pub commitment: UncheckedAccount<'info>,
+    #[account(init_if_needed, payer = user, space = 8 + Pass::INIT_SPACE, seeds = [PASS_SEED, user.key().as_ref()], bump)]
+    pub pass: Box<Account<'info, Pass>>,
 }
 
 #[derive(Accounts)]

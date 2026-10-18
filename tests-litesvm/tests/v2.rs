@@ -120,6 +120,10 @@ fn init_config_ix(env_config: Pubkey, authority: &Pubkey, p: ConfigParams) -> In
 
 fn setup() -> Env { setup_with(|_| {}) }
 fn setup_with(tweak: impl Fn(&mut ConfigParams)) -> Env {
+    setup_full(tweak, ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, big_line_vest_secs: 0, ..Default::default() })
+}
+fn setup_ext(ext: ExtParams) -> Env { setup_full(|_| {}, ext) }
+fn setup_full(tweak: impl Fn(&mut ConfigParams), ext: ExtParams) -> Env {
     let mut svm = LiteSVM::new();
     svm.add_program_from_file(cpmm(), "fixtures/raydium_cpmm.so").unwrap();
     svm.add_program_from_file(mpl(), "fixtures/mpl_token_metadata.so").unwrap();
@@ -150,7 +154,29 @@ fn setup_with(tweak: impl Fn(&mut ConfigParams)) -> Env {
     let ix = init_config_ix(config, &env.admin.pubkey(), p);
     let admin = env.admin.insecure_clone();
     send(&mut env.svm, vec![ix], &admin).unwrap();
+    // Extra settings (big-line vesting is off unless a test turns it on).
+    init_ext(&mut env, ext);
     env
+}
+fn pass_pda(u: &Pubkey) -> Pubkey { Pubkey::find_program_address(&[PASS_SEED, u.as_ref()], &pid()).0 }
+fn pass_of(env: &Env, u: &Pubkey) -> Option<Pass> { env.svm.get_account(&pass_pda(u)).map(|a| Pass::try_deserialize(&mut a.data.as_slice()).unwrap()) }
+fn ext_pda() -> Pubkey { Pubkey::find_program_address(&[CONFIG_EXT_SEED], &pid()).0 }
+fn init_ext(env: &mut Env, params: ExtParams) {
+    let admin = env.admin.insecure_clone();
+    let ix = Instruction {
+        program_id: pid(),
+        accounts: fairlaunch::accounts::InitConfigExt { authority: admin.pubkey(), config: env.config, config_ext: ext_pda(), system_program: system_program::ID }.to_account_metas(None),
+        data: fairlaunch::instruction::InitConfigExt { params }.data(),
+    };
+    send(&mut env.svm, vec![ix], &admin).unwrap();
+}
+/// After the cover charge, one more buy from a fresh wallet completes a curve the line left
+/// just short of full.
+fn finish_curve(env: &mut Env, l: &L) {
+    advance(&mut env.svm, DECAY + 1, 70);
+    let closer = user(&mut env.svm, 10);
+    trade(env, l, &closer, true, SOL).unwrap();
+    assert!(launch_state(&env.svm, &l.launch).complete, "curve completes after the cover charge");
 }
 
 fn send(svm: &mut LiteSVM, ixs: Vec<Instruction>, payer: &Keypair) -> Result<Vec<String>, String> {
@@ -228,7 +254,7 @@ fn commit(env: &mut Env, l: &L, u: &Keypair, lamports: u64) -> Result<(), String
 fn settle(env: &mut Env, l: &L, payer: &Keypair) -> Result<(), String> {
     let ix = Instruction {
         program_id: pid(),
-        accounts: fairlaunch::accounts::Settle { config: env.config, treasury: env.treasury, launch: l.launch }.to_account_metas(None),
+        accounts: fairlaunch::accounts::Settle { config: env.config, treasury: env.treasury, launch: l.launch, config_ext: ext_pda() }.to_account_metas(None),
         data: fairlaunch::instruction::Settle {}.data(),
     };
     send(&mut env.svm, vec![ix], payer).map(|_| ())
@@ -240,6 +266,7 @@ fn claim(env: &mut Env, l: &L, u: &Keypair) -> Result<(), String> {
         accounts: fairlaunch::accounts::Claim {
             user: u.pubkey(), launch: l.launch, mint: l.mint, commitment, vault: l.vault, user_ata: ata(&u.pubkey(), &l.mint),
             token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID,
+            pass: pass_pda(&u.pubkey()),
         }.to_account_metas(None),
         data: fairlaunch::instruction::Claim {}.data(),
     };
@@ -268,6 +295,7 @@ fn trade(env: &mut Env, l: &L, u: &Keypair, buy: bool, amount: u64) -> Result<()
             user_ata: ata(&u.pubkey(), &l.mint), token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID,
             system_program: system_program::ID,
             commitment: Pubkey::find_program_address(&[COMMIT_SEED, l.launch.as_ref(), u.pubkey().as_ref()], &pid()).0,
+            pass: pass_pda(&u.pubkey()),
         }.to_account_metas(None),
         data,
     };
@@ -582,6 +610,9 @@ fn graduates_into_raydium_burns_lp_and_collects_creator_fees() {
     advance(&mut env.svm, AUCTION, 20);
     settle(&mut env, &l, &whales[0]).unwrap();
     let s = launch_state(&env.svm, &l.launch);
+    assert!(!s.complete && s.real_token == SETTLE_SLIVER_TOKENS, "a full line stops just short of the curve during the cover charge");
+    finish_curve(&mut env, &l);
+    let s = launch_state(&env.svm, &l.launch);
     assert!(s.complete && s.real_token == 0);
     for w in &whales[..5] { claim(&mut env, &l, w).unwrap(); } // some claim before graduation
 
@@ -893,6 +924,7 @@ fn seventy_thirty_curve_bonds_at_the_curve_price() {
     let ws = fill_line(&mut env, &l, 80);
     advance(&mut env.svm, AUCTION, 20);
     settle(&mut env, &l, &ws[0]).unwrap();
+    finish_curve(&mut env, &l);
     let s = launch_state(&env.svm, &l.launch);
     assert!(s.complete, "a full line of 3% wallets fills a 20 SOL curve");
     let end_price = s.virtual_sol as f64 / s.virtual_token as f64;
@@ -1055,6 +1087,7 @@ fn someone_creating_the_raydium_pool_first_cannot_block_graduation() {
     advance(&mut env.svm, AUCTION, 20);
     settle(&mut env, &l, &attacker).unwrap();
     claim(&mut env, &l, &attacker).unwrap();
+    finish_curve(&mut env, &l);
     assert!(launch_state(&env.svm, &l.launch).complete);
 
     // Attack: create the coin/WSOL pool at Raydium's predictable address first.
@@ -1213,7 +1246,7 @@ fn run_fuzz(seed: u64, steps: usize) -> (usize, usize, usize) {
                     let should = is_open(&s);
                     match trade(&mut env, &l, &users[u], true, amt) {
                         Ok(()) => { assert!(should, "[{ctx}] buy accepted while curve closed (settled {} cancelled {} complete {})", s.settled, s.cancelled, s.complete); ok += 1 }
-                        Err(e) => { assert!(!should || funds_err(&e), "[{ctx}] buy refused on open curve: {e}"); rejected += 1 }
+                        Err(e) => { assert!(!should || funds_err(&e) || e.contains("CurveFillTooEarly"), "[{ctx}] buy refused on open curve: {e}"); rejected += 1 }
                     }
                 }
                 9 => {
@@ -1360,3 +1393,254 @@ fn every_new_coin_pays_the_storage_fee_to_the_storage_wallet() {
     create(&mut env, &creator, seed(95), 0, 0, 0).unwrap();
     assert_eq!(bal(&env.svm, &wallet), 1_000_000 + 2 * FEE);
 }
+
+// ───────────────────────────── anti-dump ─────────────────────────────
+
+fn big_line_ext() -> ExtParams { ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 2_500, big_line_vest_secs: 3_600, ..Default::default() } }
+fn commit_pda(l: &L, u: &Pubkey) -> Pubkey { Pubkey::find_program_address(&[COMMIT_SEED, l.launch.as_ref(), u.as_ref()], &pid()).0 }
+fn share_of(env: &Env, l: &L, committed: u64) -> u64 {
+    let s = launch_state(&env.svm, &l.launch);
+    (s.batch_tokens as u128 * committed as u128 / s.total_committed as u128) as u64
+}
+
+#[test]
+fn a_full_line_cannot_complete_the_curve_during_the_cover_charge() {
+    let mut env = setup();
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(80), 0, 0, 0).unwrap();
+    let whales = fill_line(&mut env, &l, 60); // ~114 SOL: more than the whole curve
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &whales[0]).unwrap();
+    let s = launch_state(&env.svm, &l.launch);
+    assert!(!s.complete, "settle stops short of the curve while the cover charge is on");
+    assert_eq!(s.real_token, SETTLE_SLIVER_TOKENS);
+    assert!(s.batch_refund > 0, "the unused part of the line is refunded");
+    // A buy that would complete it inside the window is refused; the coin can't bond yet.
+    let late = user(&mut env.svm, 10);
+    let e = trade(&mut env, &l, &late, true, SOL).unwrap_err();
+    assert!(e.contains("CurveFillTooEarly"), "{e}");
+    assert!(graduate(&mut env, &l, &late).unwrap_err().contains("NotComplete"));
+    // Trading carries on: a small buy that leaves the curve open is fine, and so are sells.
+    claim(&mut env, &l, &whales[1]).unwrap();
+    let held = tok(&env.svm, &ata(&whales[1].pubkey(), &l.mint));
+    trade(&mut env, &l, &whales[1], false, held / 10).unwrap();
+    // After the cover charge, the next buy completes the curve and bonding works.
+    finish_curve(&mut env, &l);
+    graduate(&mut env, &l, &late).unwrap();
+    assert!(launch_state(&env.svm, &l.launch).graduated);
+}
+
+#[test]
+fn whole_line_refunds_add_up_when_the_line_stops_short() {
+    let mut env = setup();
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(81), 0, 0, 0).unwrap();
+    let whales = fill_line(&mut env, &l, 60);
+    let per = line_max(&env, &l);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &whales[0]).unwrap();
+    let s = launch_state(&env.svm, &l.launch);
+    let mut got_tokens = 0u64;
+    for w in &whales {
+        let b0 = bal(&env.svm, &w.pubkey());
+        claim(&mut env, &l, w).unwrap();
+        got_tokens += tok(&env.svm, &ata(&w.pubkey(), &l.mint));
+        let back = bal(&env.svm, &w.pubkey()) + 2_100_000 - b0; // ATA rent the claim paid
+        assert!(back > 0 && back <= per, "refund {back} <= committed {per}");
+    }
+    let s2 = launch_state(&env.svm, &l.launch);
+    assert!(got_tokens <= s.batch_tokens && s.batch_tokens - got_tokens < 60, "rounding dust only");
+    assert!(s2.escrow_sol < 60, "every refund paid out, dust {}", s2.escrow_sol);
+}
+
+#[test]
+fn a_big_line_unlocks_a_quarter_at_open_and_the_rest_over_an_hour() {
+    let mut env = setup_ext(big_line_ext());
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(82), 0, 0, 0).unwrap();
+    let ws = fill_line(&mut env, &l, 25); // ~47 SOL: a big line
+    let per = line_max(&env, &l);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &ws[0]).unwrap();
+    let s = launch_state(&env.svm, &l.launch);
+    assert_eq!((s.line_unlock_bps, s.line_vest_secs), (2_500, 3_600));
+    let a = &ws[3];
+    let share = share_of(&env, &l, per);
+    let a_ata = ata(&a.pubkey(), &l.mint);
+    claim(&mut env, &l, a).unwrap();
+    assert_eq!(tok(&env.svm, &a_ata), share / 4, "a quarter at open");
+    assert!(claim(&mut env, &l, a).unwrap_err().contains("NothingToClaim"), "nothing more yet");
+    // While locked, the rest still counts toward the 3% cap: a buy can't top the wallet past it.
+    advance(&mut env.svm, 10, 1_800);
+    claim(&mut env, &l, a).unwrap();
+    let half = tok(&env.svm, &a_ata);
+    assert!(half >= share * 5 / 8 - 1 && half <= share * 5 / 8 + 1, "62.5% after half the hour: {half} of {share}");
+    advance(&mut env.svm, 10, 3_600);
+    claim(&mut env, &l, a).unwrap();
+    assert_eq!(tok(&env.svm, &a_ata), share, "everything after the hour");
+    assert!(env.svm.get_account(&commit_pda(&l, &a.pubkey())).map(|x| x.lamports == 0 || x.data.is_empty()).unwrap_or(true), "commitment closed");
+    assert!(claim(&mut env, &l, a).is_err(), "can't claim twice");
+    // Someone who waits the whole hour gets everything in one claim.
+    let b = &ws[4];
+    claim(&mut env, &l, b).unwrap();
+    assert_eq!(tok(&env.svm, &ata(&b.pubkey(), &l.mint)), share);
+}
+
+#[test]
+fn a_small_line_opens_fully_unlocked() {
+    let mut env = setup_ext(big_line_ext());
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(83), 0, 0, 0).unwrap();
+    let ws = fill_line(&mut env, &l, 8); // ~15 SOL
+    let per = line_max(&env, &l);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &ws[0]).unwrap();
+    let s = launch_state(&env.svm, &l.launch);
+    assert_eq!(s.line_vest_secs, 0);
+    claim(&mut env, &l, &ws[1]).unwrap();
+    assert_eq!(tok(&env.svm, &ata(&ws[1].pubkey(), &l.mint)), share_of(&env, &l, per));
+}
+
+#[test]
+fn locked_line_tokens_keep_unlocking_after_the_coin_bonds() {
+    let mut env = setup_ext(big_line_ext());
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(84), 0, 0, 0).unwrap();
+    let ws = fill_line(&mut env, &l, 60);
+    let per = line_max(&env, &l);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &ws[0]).unwrap();
+    let a = &ws[2];
+    let share = share_of(&env, &l, per);
+    claim(&mut env, &l, a).unwrap();
+    finish_curve(&mut env, &l);
+    graduate(&mut env, &l, &ws[1]).unwrap();
+    advance(&mut env.svm, 10, 4_000);
+    claim(&mut env, &l, a).unwrap();
+    assert_eq!(tok(&env.svm, &ata(&a.pubkey(), &l.mint)), share, "the rest arrives after bonding too");
+}
+
+#[test]
+fn commitments_from_before_partial_claims_still_claim() {
+    let mut env = setup_ext(big_line_ext());
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(85), 0, 0, 0).unwrap();
+    let ws = fill_line(&mut env, &l, 25);
+    let per = line_max(&env, &l);
+    // Shrink two commitments to the old 81-byte layout, as if made by the previous program.
+    for w in &ws[1..3] {
+        let k = commit_pda(&l, &w.pubkey());
+        let mut acc = env.svm.get_account(&k).unwrap();
+        acc.data.truncate(COMMITMENT_V1_LEN);
+        env.svm.set_account(k, acc).unwrap();
+    }
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &ws[0]).unwrap();
+    let share = share_of(&env, &l, per);
+    claim(&mut env, &l, &ws[1]).unwrap();
+    assert_eq!(tok(&env.svm, &ata(&ws[1].pubkey(), &l.mint)), share / 4);
+    assert_eq!(env.svm.get_account(&commit_pda(&l, &ws[1].pubkey())).unwrap().data.len(), 8 + <Commitment as anchor_lang::Space>::INIT_SPACE, "grown to the new layout");
+    advance(&mut env.svm, 10, 3_600);
+    claim(&mut env, &l, &ws[1]).unwrap();
+    claim(&mut env, &l, &ws[2]).unwrap();
+    assert_eq!(tok(&env.svm, &ata(&ws[1].pubkey(), &l.mint)), share);
+    assert_eq!(tok(&env.svm, &ata(&ws[2].pubkey(), &l.mint)), share);
+}
+
+#[test]
+fn extra_settings_change_only_through_the_timelock() {
+    let mut env = setup();
+    let admin = env.admin.insecure_clone();
+    let mut p = big_line_ext();
+    let prop = |p: ExtParams| Instruction {
+        program_id: pid(),
+        accounts: fairlaunch::accounts::AdminConfigExt { authority: admin.pubkey(), config: env.config, config_ext: ext_pda() }.to_account_metas(None),
+        data: fairlaunch::instruction::ProposeConfigExt { params: p }.data(),
+    };
+    let apply = Instruction { program_id: pid(), accounts: fairlaunch::accounts::ApplyConfigExt { config_ext: ext_pda() }.to_account_metas(None), data: fairlaunch::instruction::ApplyConfigExt {}.data() };
+    let bad = ExtParams { big_line_unlock_bps: 500, ..p.clone() };
+    assert!(send(&mut env.svm, vec![prop(bad)], &admin).is_err(), "unlock below 10% refused");
+    let stranger = user(&mut env.svm, 1);
+    let ix = Instruction { program_id: pid(), accounts: fairlaunch::accounts::AdminConfigExt { authority: stranger.pubkey(), config: env.config, config_ext: ext_pda() }.to_account_metas(None), data: fairlaunch::instruction::ProposeConfigExt { params: p.clone() }.data() };
+    assert!(send(&mut env.svm, vec![ix], &stranger).is_err(), "only the admin proposes");
+    send(&mut env.svm, vec![prop(p.clone())], &admin).unwrap();
+    assert!(send(&mut env.svm, vec![apply.clone()], &stranger).unwrap_err().contains("TimelockNotReady"));
+    advance(&mut env.svm, 10, TIMELOCK + 1);
+    send(&mut env.svm, vec![apply], &stranger).unwrap();
+    let e = fairlaunch::state::ConfigExt::try_deserialize(&mut env.svm.get_account(&ext_pda()).unwrap().data.as_slice()).unwrap();
+    p._spare = [0; 32];
+    assert_eq!(e.params, p);
+    assert_eq!(e.pending_eta, 0);
+}
+
+// ───────────────────────────── Velvet Pass ─────────────────────────────
+
+/// One small launch where `w` joins the line with `amt`, the doors open and `w` claims.
+fn run_line(env: &mut Env, n: u8, w: &Keypair, amt: u64) -> L {
+    let creator = user(&mut env.svm, 5);
+    let l = create(env, &creator, seed(n), 0, 0, 0).unwrap();
+    commit(env, &l, w, amt).unwrap();
+    advance(&mut env.svm, AUCTION, 20);
+    settle(env, &l, &creator).unwrap();
+    claim(env, &l, w).unwrap();
+    l
+}
+
+#[test]
+fn velvet_pass_counts_real_lines_and_flips_cost_a_tier() {
+    let mut env = setup();
+    let w = user(&mut env.svm, 60);
+    // Tiny lines don't count.
+    run_line(&mut env, 100, &w, PASS_MIN_LINE_SOL - 1);
+    assert_eq!(pass_of(&env, &w.pubkey()).unwrap().lines, 0);
+    for i in 0..3 { run_line(&mut env, 101 + i, &w, SOL / 2); }
+    assert_eq!(pass_of(&env, &w.pubkey()).unwrap().tier(), 1, "Regular after 3 lines");
+    for i in 0..7 { run_line(&mut env, 110 + i, &w, SOL / 2); }
+    let p = pass_of(&env, &w.pubkey()).unwrap();
+    assert_eq!((p.lines, p.tier()), (10, 2), "VIP after 10 lines and 5 SOL");
+    // A flip: selling while the cover charge is on drops a tier.
+    let l = run_line(&mut env, 120, &w, SOL / 2);
+    let held = tok(&env.svm, &ata(&w.pubkey(), &l.mint));
+    trade(&mut env, &l, &w, false, held / 2).unwrap();
+    let p = pass_of(&env, &w.pubkey()).unwrap();
+    assert_eq!((p.flips, p.tier()), (1, 1), "a flip costs a tier");
+    // Selling after the cover charge is not a flip.
+    advance(&mut env.svm, DECAY + 1, 70);
+    trade(&mut env, &l, &w, false, held / 4).unwrap();
+    assert_eq!(pass_of(&env, &w.pubkey()).unwrap().flips, 1);
+    // Five clean lines heal it.
+    for i in 0..5 { run_line(&mut env, 130 + i, &w, SOL / 2); }
+    assert_eq!(pass_of(&env, &w.pubkey()).unwrap().tier(), 2, "healed after 5 clean lines");
+}
+
+#[test]
+fn vips_pay_half_the_cover_charge() {
+    let mut env = setup();
+    let vip = user(&mut env.svm, 60);
+    for i in 0..10 { run_line(&mut env, 140 + i, &vip, SOL / 2); }
+    assert_eq!(pass_of(&env, &vip.pubkey()).unwrap().tier(), 2);
+    let guest = user(&mut env.svm, 10);
+    let creator = user(&mut env.svm, 5);
+    let l = create(&mut env, &creator, seed(160), 0, 0, 0).unwrap();
+    commit(&mut env, &l, &creator, SOL / 2).unwrap();
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &creator).unwrap();
+    // Both buy the same amount at the same moment; the VIP's fee premium is half.
+    let s = launch_state(&env.svm, &l.launch);
+    let cfg = config_state(&env);
+    let full = fairlaunch::math::fee_bps_at(slot(&env.svm), s.trading_start_slot, cfg.decay_slots, cfg.max_snipe_fee_bps, cfg.base_fee_bps);
+    assert!(full > 4_000);
+    let t0 = bal(&env.svm, &env.treasury);
+    trade(&mut env, &l, &guest, true, SOL / 10).unwrap();
+    let guest_fee_flow = bal(&env.svm, &env.treasury) - t0;
+    let t1 = bal(&env.svm, &env.treasury);
+    trade(&mut env, &l, &vip, true, SOL / 10).unwrap();
+    let vip_fee_flow = bal(&env.svm, &env.treasury) - t1;
+    let g = tok(&env.svm, &ata(&guest.pubkey(), &l.mint));
+    let v = tok(&env.svm, &ata(&vip.pubkey(), &l.mint));
+    println!("guest got {g}, VIP got {v} (fee flows {guest_fee_flow} / {vip_fee_flow})");
+    // At ~50% cover the guest buys with ~0.5 of each SOL, the VIP with ~0.75 (and bought second,
+    // at a slightly higher price).
+    assert!(v as f64 > g as f64 * 1.35, "the VIP gets clearly more tokens for the same SOL at the open");
+}
+
