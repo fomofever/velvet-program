@@ -211,20 +211,24 @@ fn send_coin<'info>(
     )
 }
 
-fn is_token_program(key: &Pubkey) -> bool {
-    *key == token::ID || *key == spl_token_2022::ID
-}
-
 /// A coin holder's token account from either token program: (mint, owner, amount).
 fn read_holder_account(acc: &AccountInfo) -> Result<(Pubkey, Pubkey, u64)> {
-    require!(is_token_program(acc.owner), FairError::BadRewardAccount);
+    use spl_token_2022::extension::StateWithExtensions;
     let data = acc.try_borrow_data()?;
-    // A plain account is exactly 165 bytes; a Token-2022 account with extensions is longer and
-    // marks itself as an account (type 2) right after the base layout.
-    require!(data.len() == spl_token::state::Account::LEN || (data.len() > spl_token::state::Account::LEN && data[spl_token::state::Account::LEN] == 2), FairError::BadRewardAccount);
-    let ta = spl_token::state::Account::unpack_from_slice(&data).map_err(|_| error!(FairError::BadRewardAccount))?;
-    require!(ta.state == spl_token::state::AccountState::Initialized, FairError::BadRewardAccount);
-    Ok((ta.mint, ta.owner, ta.amount))
+    let ta = if *acc.owner == token::ID {
+        // Classic token accounts are exactly 165 bytes (multisig accounts are 355).
+        require!(data.len() == spl_token::state::Account::LEN, FairError::BadRewardAccount);
+        let a = spl_token::state::Account::unpack(&data).map_err(|_| error!(FairError::BadRewardAccount))?;
+        (a.mint, a.owner, a.amount, a.state == spl_token::state::AccountState::Initialized)
+    } else if *acc.owner == spl_token_2022::ID {
+        // Token-2022's own parser checks the account type and rejects multisig accounts.
+        let a = StateWithExtensions::<spl_token_2022::state::Account>::unpack(&data).map_err(|_| error!(FairError::BadRewardAccount))?.base;
+        (a.mint, a.owner, a.amount, a.state == spl_token_2022::state::AccountState::Initialized)
+    } else {
+        return err!(FairError::BadRewardAccount);
+    };
+    require!(ta.3, FairError::BadRewardAccount);
+    Ok((ta.0, ta.1, ta.2))
 }
 
 /// Read a commitment of either layout (before/after `claimed` and `refunded` were added).
@@ -1091,6 +1095,7 @@ pub mod fairlaunch {
             l.epoch_started_at = now;
             l.epoch_budget = l.reward_sol;
             l.epoch_paid = 0;
+            l.epoch_last_wallet = Pubkey::default();
         } else {
             require!(epoch == l.reward_epochs, FairError::BadEpoch);
             require!(now <= l.epoch_started_at.checked_add(EPOCH_BATCH_WINDOW_SECS).ok_or(FairError::Overflow)?, FairError::EpochWindowClosed);
@@ -1116,9 +1121,14 @@ pub mod fairlaunch {
         let budget = l.epoch_budget as u128;
 
         let launch_info = l.to_account_info();
+        // Each wallet at most once per epoch: payouts go in strictly increasing wallet order,
+        // continuing from the last wallet paid in this epoch's earlier batches.
+        let mut last = l.epoch_last_wallet;
         for (i, amount) in amounts.iter().enumerate() {
             let token_acc = &rem[i * 2];
             let wallet = &rem[i * 2 + 1];
+            require!(wallet.key().to_bytes() > last.to_bytes(), FairError::BadRewardAccount);
+            last = wallet.key();
             require!(wallet.key() != launch_info.key(), FairError::BadRewardAccount);
             let (ta_mint, ta_owner, ta_amount) = read_holder_account(token_acc)?;
             require!(ta_mint == l.mint && ta_owner == wallet.key() && ta_amount > 0, FairError::BadRewardAccount);
@@ -1131,6 +1141,7 @@ pub mod fairlaunch {
             pay_from_pda(&launch_info, wallet, *amount)?;
         }
         l.epoch_paid = paid;
+        l.epoch_last_wallet = last;
         l.reward_sol -= total;
         l.reward_paid = l.reward_paid.checked_add(total).ok_or(FairError::Overflow)?;
         emit!(RewardsPaid { launch: l.key(), epoch, recipients: amounts.len() as u32, total, remaining: l.reward_sol });

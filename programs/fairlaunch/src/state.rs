@@ -234,7 +234,11 @@ pub struct Launch {
     pub line_vest_secs: u32,
     /// Where the coin bonded: 0 = Raydium CPMM, 1 = Velvet Pools.
     pub pool_kind: u8,
-    pub _reserved: [u8; 57],
+    /// Highest wallet paid so far in the current payout epoch. Within an epoch every payout
+    /// must go to a strictly higher wallet address, so no wallet can be paid twice in one epoch
+    /// (across all of its batches). Reset when a new epoch starts.
+    pub epoch_last_wallet: Pubkey,
+    pub _reserved: [u8; 25],
 }
 
 impl Launch {

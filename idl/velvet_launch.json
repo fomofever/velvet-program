@@ -5180,11 +5180,20 @@
             "type": "u8"
           },
           {
+            "name": "epoch_last_wallet",
+            "docs": [
+              "Highest wallet paid so far in the current payout epoch. Within an epoch every payout",
+              "must go to a strictly higher wallet address, so no wallet can be paid twice in one epoch",
+              "(across all of its batches). Reset when a new epoch starts."
+            ],
+            "type": "pubkey"
+          },
+          {
             "name": "_reserved",
             "type": {
               "array": [
                 "u8",
-                57
+                25
               ]
             }
           }

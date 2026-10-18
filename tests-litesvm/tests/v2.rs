@@ -349,7 +349,14 @@ fn trade(env: &mut Env, l: &L, u: &Keypair, buy: bool, amount: u64) -> Result<()
 fn distribute(env: &mut Env, l: &L, signer: &Keypair, pays: &[(Pubkey, u64)]) -> Result<(), String> {
     distribute_epoch(env, l, signer, 1, pays)
 }
+/// Pays in wallet order, as the program requires (and the crank does).
 fn distribute_epoch(env: &mut Env, l: &L, signer: &Keypair, epoch: u32, pays: &[(Pubkey, u64)]) -> Result<(), String> {
+    let mut sorted = pays.to_vec();
+    sorted.sort_by_key(|p| p.0.to_bytes());
+    distribute_raw(env, l, signer, epoch, &sorted)
+}
+/// Pays exactly in the order given.
+fn distribute_raw(env: &mut Env, l: &L, signer: &Keypair, epoch: u32, pays: &[(Pubkey, u64)]) -> Result<(), String> {
     let s = launch_state(&env.svm, &l.launch);
     let pool_token_vault = if !s.graduated { None } else if s.pool_kind == 1 { Some(fairlaunch::vpools::vault(&s.pool, &l.mint)) } else { Some(raydium::vault(&cpmm(), &s.pool, &l.mint)) };
     let mut metas = fairlaunch::accounts::Distribute {
@@ -2101,4 +2108,66 @@ fn token_2022_coins_refuse_the_classic_token_program() {
     assert!(trade(&mut env, &wrong, &u, true, SOL / 10).is_err());
     trade(&mut env, &l, &u, true, SOL / 10).unwrap();
     assert!(tok(&env.svm, &l.ata(&u.pubkey())) > 0);
+}
+
+/// Review finding: a stolen distributor key could list one tiny holder many times (in one call or
+/// across an epoch's batches) and pay it the whole pool. Each wallet is now paid at most once per
+/// epoch: payouts must go in strictly increasing wallet order across the epoch's batches.
+#[test]
+fn a_wallet_is_paid_at_most_once_per_epoch() {
+    let mut env = setup();
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(230), SOL, 0, 0).unwrap();
+    let ws = fill_line(&mut env, &l, 4);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &ws[0]).unwrap();
+    for w in &ws { claim(&mut env, &l, w).unwrap(); }
+    let pool = launch_state(&env.svm, &l.launch).reward_sol;
+    assert!(pool > 1000);
+    let dist = env.distributor.insecure_clone();
+    let mut keys: Vec<Pubkey> = ws.iter().map(|w| w.pubkey()).collect();
+    keys.sort_by_key(|k| k.to_bytes());
+    let tiny = pool / 1000;
+    // The same wallet twice in one call: refused.
+    let e = distribute_raw(&mut env, &l, &dist, 1, &[(keys[0], tiny), (keys[0], tiny)]).unwrap_err();
+    assert!(e.contains("BadRewardAccount"), "{e}");
+    // Out of order: refused.
+    let e = distribute_raw(&mut env, &l, &dist, 1, &[(keys[1], tiny), (keys[0], tiny)]).unwrap_err();
+    assert!(e.contains("BadRewardAccount"), "{e}");
+    // In order: fine. A later batch in the same epoch can't go back to a wallet already paid...
+    distribute_raw(&mut env, &l, &dist, 1, &[(keys[0], tiny), (keys[1], tiny)]).unwrap();
+    let e = distribute_raw(&mut env, &l, &dist, 1, &[(keys[1], tiny)]).unwrap_err();
+    assert!(e.contains("BadRewardAccount"), "{e}");
+    // ...but can carry on with higher ones.
+    distribute_raw(&mut env, &l, &dist, 1, &[(keys[2], tiny)]).unwrap();
+    // The next epoch starts over.
+    advance(&mut env.svm, 10, 3_100);
+    distribute_raw(&mut env, &l, &dist, 2, &[(keys[0], tiny)]).unwrap();
+}
+
+/// Review finding: an account owned by the token program that isn't a plain token account (e.g. a
+/// multisig, whose bytes are mostly chosen by its creator) must not pass as a holder's account.
+#[test]
+fn only_real_token_accounts_count_as_holders() {
+    let mut env = setup();
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(231), SOL, 0, 0).unwrap();
+    let ws = fill_line(&mut env, &l, 2);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &creator).unwrap();
+    for w in &ws { claim(&mut env, &l, w).unwrap(); }
+    let thief = user(&mut env.svm, 1);
+    // A 355-byte account (multisig size) laid out to look like a big holder of this coin.
+    let mut data = vec![0u8; 355];
+    data[..32].copy_from_slice(l.mint.as_ref());
+    data[32..64].copy_from_slice(thief.pubkey().as_ref());
+    data[64..72].copy_from_slice(&(10_000_000_000_000u64).to_le_bytes());
+    data[108] = 1; // initialized
+    data[165] = 2; // "account" type byte
+    let fake = l.ata(&thief.pubkey());
+    env.svm.set_account(fake, Account { lamports: 10_000_000, data, owner: l.tp, executable: false, rent_epoch: 0 }).unwrap();
+    let dist = env.distributor.insecure_clone();
+    let pool = launch_state(&env.svm, &l.launch).reward_sol;
+    let e = distribute(&mut env, &l, &dist, &[(thief.pubkey(), pool / 2)]).unwrap_err();
+    assert!(e.contains("BadRewardAccount"), "{e}");
 }
