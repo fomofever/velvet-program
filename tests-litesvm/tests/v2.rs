@@ -128,6 +128,7 @@ fn setup_full(tweak: impl Fn(&mut ConfigParams), ext: ExtParams) -> Env {
     svm.add_program_from_file(cpmm(), "fixtures/raydium_cpmm.so").unwrap();
     svm.add_program_from_file(mpl(), "fixtures/mpl_token_metadata.so").unwrap();
     svm.add_program_from_file(lockp(), "fixtures/raydium_lock.so").unwrap();
+    svm.add_program_from_file(fairlaunch::vpools::ID, "../target/deploy/velvet_pools.so").unwrap();
     load_fixture(&mut svm, "fixtures/amm_config_0.json");
     load_fixture(&mut svm, "fixtures/create_pool_fee.json");
     if svm.get_account(&wsol()).map(|a| a.owner != spl_token::ID).unwrap_or(true) {
@@ -306,7 +307,7 @@ fn distribute(env: &mut Env, l: &L, signer: &Keypair, pays: &[(Pubkey, u64)]) ->
 }
 fn distribute_epoch(env: &mut Env, l: &L, signer: &Keypair, epoch: u32, pays: &[(Pubkey, u64)]) -> Result<(), String> {
     let s = launch_state(&env.svm, &l.launch);
-    let pool_token_vault = if s.graduated { Some(raydium::vault(&cpmm(), &s.pool, &l.mint)) } else { None };
+    let pool_token_vault = if !s.graduated { None } else if s.pool_kind == 1 { Some(fairlaunch::vpools::vault(&s.pool, &l.mint)) } else { Some(raydium::vault(&cpmm(), &s.pool, &l.mint)) };
     let mut metas = fairlaunch::accounts::Distribute {
         distributor: signer.pubkey(), config: env.config, launch: l.launch, mint: l.mint, vault: l.vault, escrow: l.escrow, pool_token_vault,
     }.to_account_metas(None);
@@ -514,7 +515,7 @@ fn graduate_with(env: &mut Env, l: &L, payer: &Keypair, pool_kp: &Keypair) -> Re
             wsol_mint: wsol(), cpmm_program: cpmm(), amm_config: amm_config(), ray_authority: raydium::authority(&cpmm()),
             pool_state: k.pool, lp_mint: k.lp_mint, token_0_vault: k.v0, token_1_vault: k.v1, create_pool_fee: pool_fee_rx(),
             observation: k.obs, token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID,
-            system_program: system_program::ID, rent: sysvar::rent::ID,
+            system_program: system_program::ID, rent: sysvar::rent::ID, config_ext: ext_pda(),
         }.to_account_metas(None),
         data: fairlaunch::instruction::Graduate {}.data(),
     };
@@ -1568,7 +1569,6 @@ fn extra_settings_change_only_through_the_timelock() {
     advance(&mut env.svm, 10, TIMELOCK + 1);
     send(&mut env.svm, vec![apply], &stranger).unwrap();
     let e = fairlaunch::state::ConfigExt::try_deserialize(&mut env.svm.get_account(&ext_pda()).unwrap().data.as_slice()).unwrap();
-    p._spare = [0; 32];
     assert_eq!(e.params, p);
     assert_eq!(e.pending_eta, 0);
 }
@@ -1642,5 +1642,209 @@ fn vips_pay_half_the_cover_charge() {
     // At ~50% cover the guest buys with ~0.5 of each SOL, the VIP with ~0.75 (and bought second,
     // at a slightly higher price).
     assert!(v as f64 > g as f64 * 1.35, "the VIP gets clearly more tokens for the same SOL at the open");
+}
+
+// ───────────────────────────── Velvet Pools ─────────────────────────────
+
+use fairlaunch::vpools;
+fn vp_ext() -> ExtParams { ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, big_line_vest_secs: 0, velvet_pools: true, ..Default::default() } }
+fn grad_of(l: &L) -> Pubkey { Pubkey::find_program_address(&[GRAD_SEED, l.launch.as_ref()], &pid()).0 }
+
+/// A coin that fills its curve and bonds into Velvet Pools.
+fn bond_into_velvet(env: &mut Env, n: u8) -> (L, Keypair, Vec<Keypair>) {
+    let creator = user(&mut env.svm, 10);
+    let l = create(env, &creator, seed(n), 0, 0, 0).unwrap();
+    let ws = fill_line(env, &l, 60);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(env, &l, &ws[0]).unwrap();
+    for w in &ws[..4] { claim(env, &l, w).unwrap(); }
+    finish_curve(env, &l);
+    graduate_velvet(env, &l, &ws[1]).unwrap();
+    (l, creator, ws)
+}
+fn graduate_velvet(env: &mut Env, l: &L, payer: &Keypair) -> Result<Vec<String>, String> {
+    let grad = grad_of(l);
+    let pool = vpools::pool(&l.mint);
+    let prep = Instruction {
+        program_id: pid(),
+        accounts: fairlaunch::accounts::PrepareGraduation { payer: payer.pubkey(), config: env.config, treasury: env.treasury, launch: l.launch, grad_auth: grad }.to_account_metas(None),
+        data: fairlaunch::instruction::PrepareGraduation {}.data(),
+    };
+    let ix = Instruction {
+        program_id: pid(),
+        accounts: fairlaunch::accounts::GraduateVelvet {
+            payer: payer.pubkey(), config: env.config, config_ext: ext_pda(), treasury: env.treasury, launch: l.launch, mint: l.mint, vault: l.vault,
+            grad_auth: grad, grad_wsol: ata(&grad, &wsol()), grad_token: ata(&grad, &l.mint), wsol_mint: wsol(), pools_program: vpools::ID,
+            pool, pool_vault_auth: vpools::vault_auth(), pool_sol_vault: vpools::vault(&pool, &wsol()), pool_token_vault: vpools::vault(&pool, &l.mint),
+            token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID,
+        }.to_account_metas(None),
+        data: fairlaunch::instruction::GraduateVelvet {}.data(),
+    };
+    send(&mut env.svm, vec![prep, ix], payer)
+}
+/// Swap on a Velvet pool: `buy` with `amount` lamports, or sell `amount` tokens.
+fn vp_swap(env: &mut Env, l: &L, u: &Keypair, buy: bool, amount: u64, min_out: u64) -> Result<Vec<String>, String> {
+    let pool = vpools::pool(&l.mint);
+    let user_wsol = ata(&u.pubkey(), &wsol());
+    let user_tok = ata(&u.pubkey(), &l.mint);
+    let mut ixs = vec![
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(&u.pubkey(), &u.pubkey(), &wsol(), &spl_token::ID),
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(&u.pubkey(), &u.pubkey(), &l.mint, &spl_token::ID),
+    ];
+    if buy {
+        ixs.push(solana_sdk::system_instruction::transfer(&u.pubkey(), &user_wsol, amount));
+        ixs.push(spl_token::instruction::sync_native(&spl_token::ID, &user_wsol).unwrap());
+    }
+    let mut data = vec![248, 198, 158, 145, 225, 117, 135, 200];
+    data.push(buy as u8);
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&min_out.to_le_bytes());
+    ixs.push(Instruction {
+        program_id: vpools::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(u.pubkey(), true), AccountMeta::new(pool, false), AccountMeta::new_readonly(vpools::vault_auth(), false),
+            AccountMeta::new(vpools::vault(&pool, &wsol()), false), AccountMeta::new(vpools::vault(&pool, &l.mint), false),
+            AccountMeta::new(user_wsol, false), AccountMeta::new(user_tok, false), AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data,
+    });
+    // unwrap whatever SOL is left in the user's WSOL account
+    ixs.push(spl_token::instruction::close_account(&spl_token::ID, &user_wsol, &u.pubkey(), &u.pubkey(), &[]).unwrap());
+    send(&mut env.svm, ixs, u)
+}
+fn collect_velvet(env: &mut Env, l: &L, creator: &Pubkey, payer: &Keypair) -> Result<Vec<String>, String> {
+    let grad = grad_of(l);
+    let pool = vpools::pool(&l.mint);
+    let ix = Instruction {
+        program_id: pid(),
+        accounts: fairlaunch::accounts::CollectVelvetFees {
+            payer: payer.pubkey(), config: env.config, treasury: env.treasury, launch: l.launch, mint: l.mint, creator: *creator,
+            grad_auth: grad, grad_wsol: ata(&grad, &wsol()), wsol_mint: wsol(), pools_program: vpools::ID, pool,
+            pool_vault_auth: vpools::vault_auth(), pool_sol_vault: vpools::vault(&pool, &wsol()),
+            token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID,
+        }.to_account_metas(None),
+        data: fairlaunch::instruction::CollectVelvetFees {}.data(),
+    };
+    send(&mut env.svm, vec![ix], payer)
+}
+fn pool_fees_owed(env: &Env, l: &L) -> u64 {
+    let a = env.svm.get_account(&vpools::pool(&l.mint)).unwrap();
+    // 8 disc + 5 pubkeys + 2 bumps, then protocol_fees_sol
+    u64::from_le_bytes(a.data[8 + 160 + 2..8 + 160 + 10].try_into().unwrap())
+}
+
+#[test]
+fn coins_bond_into_velvet_pools_with_locked_liquidity() {
+    let mut env = setup_ext(vp_ext());
+    let (l, _creator, ws) = bond_into_velvet(&mut env, 200);
+    let s = launch_state(&env.svm, &l.launch);
+    let pool = vpools::pool(&l.mint);
+    assert!(s.graduated && s.lp_locked && s.pool_kind == 1 && s.pool == pool);
+    assert_eq!(env.svm.get_account(&pool).unwrap().owner, vpools::ID);
+    let sv = tok(&env.svm, &vpools::vault(&pool, &wsol()));
+    let tv = tok(&env.svm, &vpools::vault(&pool, &l.mint));
+    assert_eq!(tv, s.lp_reserve, "the whole LP reserve is in the pool");
+    assert_eq!(sv, s.grad_pool_sol, "the curve's SOL is in the pool");
+    let curve_end = s.virtual_sol as f64 / s.virtual_token as f64;
+    let pool_price = sv as f64 / tv as f64;
+    println!("velvet pool: {:.2} SOL, {:.1}M tokens, gap to curve {:.2}%", sv as f64 / 1e9, tv as f64 / 1e12, (1.0 - pool_price / curve_end) * 100.0);
+    assert!(pool_price <= curve_end && pool_price > curve_end * 0.9);
+    // The Raydium path is closed while Velvet Pools is on.
+    let late = user(&mut env.svm, 5);
+    let _ = ws;
+    let l2c = user(&mut env.svm, 10);
+    let l2 = create(&mut env, &l2c, seed(201), 0, 0, 0).unwrap();
+    let w2 = fill_line(&mut env, &l2, 60);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l2, &w2[0]).unwrap();
+    finish_curve(&mut env, &l2);
+    let e = graduate(&mut env, &l2, &late).unwrap_err();
+    assert!(e.contains("WrongPoolAccount"), "{e}");
+}
+
+#[test]
+fn velvet_pool_swaps_charge_0_35_percent_in_sol_and_split_it_three_ways() {
+    let mut env = setup_ext(vp_ext());
+    let (l, creator, ws) = bond_into_velvet(&mut env, 202);
+    let trader = user(&mut env.svm, 50);
+    let pool = vpools::pool(&l.mint);
+    let sv0 = tok(&env.svm, &vpools::vault(&pool, &wsol()));
+    let tv0 = tok(&env.svm, &vpools::vault(&pool, &l.mint));
+    // Buy 10 SOL.
+    vp_swap(&mut env, &l, &trader, true, 10 * SOL, 1).unwrap();
+    let got = tok(&env.svm, &ata(&trader.pubkey(), &l.mint));
+    let fee = (10 * SOL as u128 * 3_500 + 999_999) / 1_000_000;
+    let expect = ((10 * SOL as u128 - fee) * tv0 as u128 / (sv0 as u128 + 10 * SOL as u128 - fee)) as u64;
+    assert_eq!(got, expect, "constant product after a 0.35% fee");
+    let owed = pool_fees_owed(&env, &l);
+    assert_eq!(owed as u128, fee * 428_571 / 1_000_000, "0.15 of the 0.35% is set aside");
+    // Slippage guard.
+    let e = vp_swap(&mut env, &l, &trader, false, got / 2, 100 * SOL).unwrap_err();
+    assert!(e.contains("ExceededSlippage"), "{e}");
+    // Sell half back: the fee comes off the SOL out.
+    let b0 = bal(&env.svm, &trader.pubkey());
+    vp_swap(&mut env, &l, &trader, false, got / 2, 1).unwrap();
+    let back = bal(&env.svm, &trader.pubkey()) + 5_000 * 2 - b0; // tx fees aside
+    assert!(back > 4 * SOL && back < 6 * SOL, "half the bag back: {back}");
+    // Selling the rest: the whole round trip returns less than the 10 SOL put in.
+    let rest = tok(&env.svm, &ata(&trader.pubkey(), &l.mint));
+    let b1 = bal(&env.svm, &trader.pubkey());
+    vp_swap(&mut env, &l, &trader, false, rest, 1).unwrap();
+    let total_back = back + bal(&env.svm, &trader.pubkey()) + 10_000 - b1;
+    assert!(total_back < 10 * SOL && total_back > 9 * SOL, "round trip {total_back}");
+    // Collect: thirds to holders, creator, Velvet.
+    let owed = pool_fees_owed(&env, &l);
+    let (c0, t0, r0) = (bal(&env.svm, &creator.pubkey()), bal(&env.svm, &env.treasury), launch_state(&env.svm, &l.launch).reward_sol);
+    let payer = &ws[5];
+    let p0 = bal(&env.svm, &payer.pubkey());
+    collect_velvet(&mut env, &l, &creator.pubkey(), payer).unwrap();
+    let (c1, t1, r1) = (bal(&env.svm, &creator.pubkey()), bal(&env.svm, &env.treasury), launch_state(&env.svm, &l.launch).reward_sol);
+    assert_eq!(c1 - c0, owed / 3);
+    assert_eq!(r1 - r0, owed / 3);
+    assert_eq!(t1 - t0, owed - 2 * (owed / 3));
+    assert_eq!(pool_fees_owed(&env, &l), 0);
+    assert!(p0 - bal(&env.svm, &payer.pubkey()) <= 10_000, "the collector only pays the tx fee");
+    // Nothing owed: collecting again moves nothing.
+    collect_velvet(&mut env, &l, &creator.pubkey(), payer).unwrap();
+    assert_eq!(bal(&env.svm, &creator.pubkey()), c1);
+}
+
+#[test]
+fn nobody_else_can_create_a_velvet_pool_or_take_its_fees() {
+    let mut env = setup_ext(vp_ext());
+    let (l, _creator, _ws) = bond_into_velvet(&mut env, 204);
+    let attacker = user(&mut env.svm, 10);
+    // Create a pool for some other mint, signing as itself.
+    let fake_creator = &attacker;
+    let creator2 = user(&mut env.svm, 10);
+    let l2 = create(&mut env, &creator2, seed(205), 0, 0, 0).unwrap();
+    let (_, bump) = Pubkey::find_program_address(&[GRAD_SEED, l2.launch.as_ref()], &pid());
+    let ix = vpools::initialize_ix(fake_creator.pubkey(), l2.mint, wsol(), ata(&fake_creator.pubkey(), &wsol()), ata(&fake_creator.pubkey(), &l2.mint), l2.launch, bump, SOL, 1);
+    let e = send(&mut env.svm, vec![ix], &attacker).unwrap_err();
+    assert!(e.contains("NotLaunchpad") || e.contains("ConstraintTokenOwner") || e.contains("AccountNotInitialized"), "{e}");
+    // Take the fees directly from the pool program.
+    let trader = user(&mut env.svm, 20);
+    vp_swap(&mut env, &l, &trader, true, 5 * SOL, 1).unwrap();
+    let dest = ata(&attacker.pubkey(), &wsol());
+    let mk = spl_associated_token_account::instruction::create_associated_token_account_idempotent(&attacker.pubkey(), &attacker.pubkey(), &wsol(), &spl_token::ID);
+    let steal = vpools::collect_fees_ix(attacker.pubkey(), l.mint, dest);
+    let e = send(&mut env.svm, vec![mk, steal], &attacker).unwrap_err();
+    assert!(e.contains("NotOwner"), "{e}");
+    assert!(pool_fees_owed(&env, &l) > 0);
+}
+
+#[test]
+fn hold_streak_payouts_work_after_bonding_into_velvet_pools() {
+    let mut env = setup_ext(vp_ext());
+    let (l, creator, ws) = bond_into_velvet(&mut env, 206);
+    let trader = user(&mut env.svm, 20);
+    vp_swap(&mut env, &l, &trader, true, 10 * SOL, 1).unwrap();
+    collect_velvet(&mut env, &l, &creator.pubkey(), &ws[6]).unwrap();
+    let dist = env.distributor.insecure_clone();
+    let pool = launch_state(&env.svm, &l.launch).reward_sol;
+    assert!(pool > 0);
+    let b0 = bal(&env.svm, &ws[0].pubkey());
+    distribute(&mut env, &l, &dist, &[(ws[0].pubkey(), pool / 50)]).unwrap();
+    assert_eq!(bal(&env.svm, &ws[0].pubkey()) - b0, pool / 50);
 }
 

@@ -230,7 +230,9 @@ pub struct Launch {
     /// settled before read as "no vesting".
     pub line_unlock_bps: u16,
     pub line_vest_secs: u32,
-    pub _reserved: [u8; 58],
+    /// Where the coin bonded: 0 = Raydium CPMM, 1 = Velvet Pools.
+    pub pool_kind: u8,
+    pub _reserved: [u8; 57],
 }
 
 impl Launch {
@@ -308,8 +310,10 @@ pub struct ExtParams {
     pub big_line_unlock_bps: u16,
     /// The rest unlocks linearly over this long.
     pub big_line_vest_secs: u32,
+    /// New coins bond into Velvet Pools instead of Raydium.
+    pub velvet_pools: bool,
     /// Room for later settings without moving the layout.
-    pub _spare: [u8; 32],
+    pub _spare: [u8; 31],
     pub _spare2: [u8; 32],
 }
 

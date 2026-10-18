@@ -1,0 +1,23 @@
+[package]
+name = "velvet-pools"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+description = "Velvet Pools: locked constant-product pools for coins that bond on Velvet Launch. Derived from raydium-io/raydium-cp-swap (Apache-2.0) at commit 0f86d46."
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "velvet_pools"
+
+[features]
+default = []
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
+anchor-spl = { version = "0.31.1", features = ["token"] }

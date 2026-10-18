@@ -2792,6 +2792,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "velvet-pools"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "anchor-spl",
+]
+
+[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

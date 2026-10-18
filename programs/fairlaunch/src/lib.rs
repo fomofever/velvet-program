@@ -33,6 +33,7 @@ pub mod errors;
 pub mod math;
 pub mod raydium;
 pub mod state;
+pub mod vpools;
 
 use errors::{FairError, MathExt};
 use state::*;
@@ -1054,7 +1055,8 @@ pub mod fairlaunch {
         let mut locked = (ctx.accounts.vault.amount as u128) + (ctx.accounts.escrow.amount as u128);
         if l.graduated {
             let pv = ctx.accounts.pool_token_vault.as_ref().ok_or(FairError::WrongPoolAccount)?;
-            require_keys_eq!(pv.key(), raydium::vault(&cfg.cpmm_program, &l.pool, &l.mint), FairError::WrongPoolAccount);
+            let expected = if l.pool_kind == 1 { vpools::vault(&l.pool, &l.mint) } else { raydium::vault(&cfg.cpmm_program, &l.pool, &l.mint) };
+            require_keys_eq!(pv.key(), expected, FairError::WrongPoolAccount);
             locked += token_amount(&pv.to_account_info())? as u128;
         }
         let circulating = (ctx.accounts.mint.supply as u128).saturating_sub(locked);
@@ -1108,11 +1110,13 @@ pub mod fairlaunch {
         Ok(())
     }
 
-    /// Permissionless, step 2: create the Raydium CPMM pool.
+    /// Permissionless, step 2: create the Raydium CPMM pool (only while new coins still bond
+    /// into Raydium; see `graduate_velvet`).
     pub fn graduate(ctx: Context<Graduate>) -> Result<()> {
         let cfg = &ctx.accounts.config;
         let a = &ctx.accounts;
         require_keys_eq!(a.treasury.key(), cfg.treasury, FairError::WrongTreasury);
+        require!(!a.config_ext.params.velvet_pools, FairError::WrongPoolAccount);
         {
             let l = &a.launch;
             require!(l.grad_prepared, FairError::NotComplete);
@@ -1233,6 +1237,155 @@ pub mod fairlaunch {
         Ok(())
     }
 
+    /// Permissionless, step 2 when new coins bond into Velvet Pools: create the coin's pool with
+    /// the curve's SOL and the LP reserve. Velvet Pools has no withdraw at all, so the liquidity
+    /// is locked by design (no locker step).
+    pub fn graduate_velvet(ctx: Context<GraduateVelvet>) -> Result<()> {
+        let cfg = &ctx.accounts.config;
+        let a = &ctx.accounts;
+        require_keys_eq!(a.treasury.key(), cfg.treasury, FairError::WrongTreasury);
+        require!(a.config_ext.params.velvet_pools, FairError::WrongPoolAccount);
+        require!(a.launch.grad_prepared && !a.launch.graduated, FairError::NotComplete);
+        let launch_key = a.launch.key();
+        let mint_key = a.mint.key();
+        let wsol = spl_token::native_mint::ID;
+        let grad = a.grad_auth.key();
+        let pool = vpools::pool(&mint_key);
+        require_keys_eq!(a.pool.key(), pool, FairError::WrongPoolAccount);
+        require_keys_eq!(a.pool_vault_auth.key(), vpools::vault_auth(), FairError::WrongPoolAccount);
+        require_keys_eq!(a.pool_sol_vault.key(), vpools::vault(&pool, &wsol), FairError::WrongPoolAccount);
+        require_keys_eq!(a.pool_token_vault.key(), vpools::vault(&pool, &mint_key), FairError::WrongPoolAccount);
+        require_keys_eq!(a.grad_wsol.key(), associated_token::get_associated_token_address(&grad, &wsol), FairError::WrongPoolAccount);
+        require_keys_eq!(a.grad_token.key(), associated_token::get_associated_token_address(&grad, &mint_key), FairError::WrongPoolAccount);
+
+        let grad_bump = a.launch.grad_bump;
+        grad_signer!(launch_key, grad_bump, gsig);
+        let system = a.system_program.to_account_info();
+        let token_prog = a.token_program.to_account_info();
+        let lp_reserve = a.launch.lp_reserve;
+        let pool_sol = a.launch.grad_pool_sol;
+        let grad_fee = a.launch.grad_fee_paid;
+
+        for (ata, m) in [(a.grad_wsol.to_account_info(), a.wsol_mint.to_account_info()), (a.grad_token.to_account_info(), a.mint.to_account_info())] {
+            associated_token::create_idempotent(CpiContext::new_with_signer(
+                a.associated_token_program.to_account_info(),
+                associated_token::Create {
+                    payer: a.grad_auth.to_account_info(),
+                    associated_token: ata,
+                    authority: a.grad_auth.to_account_info(),
+                    mint: m,
+                    system_program: system.clone(),
+                    token_program: token_prog.clone(),
+                },
+                gsig,
+            ))?;
+        }
+        pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.grad_wsol.to_account_info(), pool_sol, gsig)?;
+        token::sync_native(CpiContext::new(token_prog.clone(), token::SyncNative { account: a.grad_wsol.to_account_info() }))?;
+        {
+            let l = &a.launch;
+            launch_signer!(l, lsig);
+            token::transfer(
+                CpiContext::new_with_signer(
+                    token_prog.clone(),
+                    Transfer { from: a.vault.to_account_info(), to: a.grad_token.to_account_info(), authority: l.to_account_info() },
+                    lsig,
+                ),
+                lp_reserve,
+            )?;
+        }
+        invoke_signed(
+            &vpools::initialize_ix(grad, mint_key, wsol, a.grad_wsol.key(), a.grad_token.key(), launch_key, grad_bump, pool_sol, lp_reserve),
+            &[
+                a.grad_auth.to_account_info(), a.mint.to_account_info(), a.wsol_mint.to_account_info(), a.pool.to_account_info(),
+                a.pool_vault_auth.to_account_info(), a.pool_sol_vault.to_account_info(), a.pool_token_vault.to_account_info(),
+                a.grad_wsol.to_account_info(), a.grad_token.to_account_info(), token_prog.clone(), system.clone(), a.pools_program.to_account_info(),
+            ],
+            gsig,
+        )?;
+        // The emptied WSOL account's rent goes back to the graduation authority; leftover
+        // overhead to the treasury, keeping a float for fee collection.
+        token::close_account(CpiContext::new_with_signer(
+            token_prog,
+            token::CloseAccount { account: a.grad_wsol.to_account_info(), destination: a.grad_auth.to_account_info(), authority: a.grad_auth.to_account_info() },
+            gsig,
+        ))?;
+        let left = a.grad_auth.lamports().saturating_sub(GRAD_AUTH_FLOAT);
+        pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.treasury.to_account_info(), left, gsig)?;
+
+        let l = &mut ctx.accounts.launch;
+        l.graduated = true;
+        l.lp_locked = true; // no LP tokens exist: the pool has no withdraw
+        l.pool = pool;
+        l.pool_kind = 1;
+        l.graduated_slot = Clock::get()?.slot;
+        emit!(Graduated { launch: launch_key, pool, sol_to_pool: pool_sol, tokens_to_pool: lp_reserve, graduation_fee: grad_fee });
+        Ok(())
+    }
+
+    /// Permissionless: collect a Velvet Pools coin's fees (0.15% of every swap, in SOL) and split
+    /// them in three equal parts: the coin's holders (hold-streak pool), its creator, and Velvet.
+    pub fn collect_velvet_fees(ctx: Context<CollectVelvetFees>) -> Result<()> {
+        let cfg = &ctx.accounts.config;
+        let a = &ctx.accounts;
+        require_keys_eq!(a.treasury.key(), cfg.treasury, FairError::WrongTreasury);
+        require!(a.launch.graduated && a.launch.pool_kind == 1, FairError::NotGraduated);
+        require_keys_eq!(a.creator.key(), a.launch.creator, FairError::NotCreator);
+        let mint_key = a.mint.key();
+        let wsol = spl_token::native_mint::ID;
+        let grad = a.grad_auth.key();
+        let pool = a.launch.pool;
+        require_keys_eq!(a.pool.key(), pool, FairError::WrongPoolAccount);
+        require_keys_eq!(a.pool_vault_auth.key(), vpools::vault_auth(), FairError::WrongPoolAccount);
+        require_keys_eq!(a.pool_sol_vault.key(), vpools::vault(&pool, &wsol), FairError::WrongPoolAccount);
+        require_keys_eq!(a.grad_wsol.key(), associated_token::get_associated_token_address(&grad, &wsol), FairError::WrongPoolAccount);
+        let launch_key = a.launch.key();
+        let grad_bump = a.launch.grad_bump;
+        grad_signer!(launch_key, grad_bump, gsig);
+        let system = a.system_program.to_account_info();
+        let token_prog = a.token_program.to_account_info();
+        associated_token::create_idempotent(CpiContext::new(
+            a.associated_token_program.to_account_info(),
+            associated_token::Create {
+                payer: a.payer.to_account_info(),
+                associated_token: a.grad_wsol.to_account_info(),
+                authority: a.grad_auth.to_account_info(),
+                mint: a.wsol_mint.to_account_info(),
+                system_program: system.clone(),
+                token_program: token_prog.clone(),
+            },
+        ))?;
+        invoke_signed(
+            &vpools::collect_fees_ix(grad, mint_key, a.grad_wsol.key()),
+            &[
+                a.grad_auth.to_account_info(), a.pool.to_account_info(), a.pool_vault_auth.to_account_info(),
+                a.pool_sol_vault.to_account_info(), a.grad_wsol.to_account_info(), token_prog.clone(), a.pools_program.to_account_info(),
+            ],
+            gsig,
+        )?;
+        let sol = token_amount(&a.grad_wsol.to_account_info())?;
+        // Unwrap: the account's rent goes back to whoever paid for it, the fees to the authority.
+        token::close_account(CpiContext::new_with_signer(
+            token_prog,
+            token::CloseAccount { account: a.grad_wsol.to_account_info(), destination: a.grad_auth.to_account_info(), authority: a.grad_auth.to_account_info() },
+            gsig,
+        ))?;
+        let to_holders = sol / 3;
+        let to_creator = sol / 3;
+        let to_treasury = sol - to_holders - to_creator;
+        pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.creator.to_account_info(), to_creator, gsig)?;
+        pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.launch.to_account_info(), to_holders, gsig)?;
+        pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.treasury.to_account_info(), to_treasury, gsig)?;
+        // The WSOL account's rent (paid by `payer` when it had to be created) goes back to them.
+        let rent_back = a.grad_auth.lamports().saturating_sub(GRAD_AUTH_FLOAT);
+        pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.payer.to_account_info(), rent_back, gsig)?;
+        let l = &mut ctx.accounts.launch;
+        l.reward_sol = l.reward_sol.checked_add(to_holders).ok_or(FairError::Overflow)?;
+        l.pool_fees_collected = l.pool_fees_collected.checked_add(sol).ok_or(FairError::Overflow)?;
+        emit!(PoolFeesCollected { launch: launch_key, sol, to_treasury, to_creator, to_holders, tokens_burned: 0 });
+        Ok(())
+    }
+
     /// Permissionless, step 3 (second transaction): lock all LP with Raydium's
     /// locker. The liquidity can never be withdrawn; the fee-key NFT goes to the
     /// graduation authority so only this program can collect the pool fees.
@@ -1308,7 +1461,7 @@ pub mod fairlaunch {
         let cfg = &ctx.accounts.config;
         let a = &ctx.accounts;
         require_keys_eq!(a.treasury.key(), cfg.treasury, FairError::WrongTreasury);
-        require!(a.launch.lp_locked, FairError::NotGraduated);
+        require!(a.launch.lp_locked && a.launch.pool_kind == 0, FairError::NotGraduated);
         require_keys_eq!(a.pool_state.key(), a.launch.pool, FairError::WrongPoolAccount);
         require_keys_eq!(a.creator.key(), a.launch.creator, FairError::NotCreator);
         let cpmm = cfg.cpmm_program;
@@ -1820,6 +1973,95 @@ pub struct Graduate<'info> {
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
+    #[account(seeds = [CONFIG_EXT_SEED], bump = config_ext.bump)]
+    pub config_ext: Box<Account<'info, ConfigExt>>,
+}
+
+#[derive(Accounts)]
+pub struct GraduateVelvet<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(seeds = [CONFIG_EXT_SEED], bump = config_ext.bump)]
+    pub config_ext: Box<Account<'info, ConfigExt>>,
+    /// CHECK: validated against config.treasury
+    #[account(mut)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
+    pub launch: Box<Account<'info, Launch>>,
+    pub mint: Box<Account<'info, Mint>>,
+    #[account(mut, associated_token::mint = mint, associated_token::authority = launch)]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    /// CHECK: system-owned PDA that creates the pool and owns its fees
+    #[account(mut, seeds = [GRAD_SEED, launch.key().as_ref()], bump = launch.grad_bump)]
+    pub grad_auth: UncheckedAccount<'info>,
+    /// CHECK: ATA(grad_auth, WSOL), checked in the handler
+    #[account(mut)]
+    pub grad_wsol: UncheckedAccount<'info>,
+    /// CHECK: ATA(grad_auth, mint), checked in the handler
+    #[account(mut)]
+    pub grad_token: UncheckedAccount<'info>,
+    /// CHECK: native mint
+    #[account(address = spl_token::native_mint::ID)]
+    pub wsol_mint: UncheckedAccount<'info>,
+    /// CHECK: Velvet Pools program
+    #[account(executable, address = vpools::ID)]
+    pub pools_program: UncheckedAccount<'info>,
+    /// CHECK: Velvet Pools pool PDA (created by it), checked in the handler
+    #[account(mut)]
+    pub pool: UncheckedAccount<'info>,
+    /// CHECK: Velvet Pools vault authority, checked in the handler
+    pub pool_vault_auth: UncheckedAccount<'info>,
+    /// CHECK: Velvet Pools vault PDA, checked in the handler
+    #[account(mut)]
+    pub pool_sol_vault: UncheckedAccount<'info>,
+    /// CHECK: Velvet Pools vault PDA, checked in the handler
+    #[account(mut)]
+    pub pool_token_vault: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CollectVelvetFees<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    /// CHECK: validated against config.treasury
+    #[account(mut)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
+    pub launch: Box<Account<'info, Launch>>,
+    pub mint: Box<Account<'info, Mint>>,
+    /// CHECK: the coin's creator, checked against the launch
+    #[account(mut)]
+    pub creator: UncheckedAccount<'info>,
+    /// CHECK: system-owned PDA that owns the pool's fees
+    #[account(mut, seeds = [GRAD_SEED, launch.key().as_ref()], bump = launch.grad_bump)]
+    pub grad_auth: UncheckedAccount<'info>,
+    /// CHECK: ATA(grad_auth, WSOL), checked in the handler
+    #[account(mut)]
+    pub grad_wsol: UncheckedAccount<'info>,
+    /// CHECK: native mint
+    #[account(address = spl_token::native_mint::ID)]
+    pub wsol_mint: UncheckedAccount<'info>,
+    /// CHECK: Velvet Pools program
+    #[account(executable, address = vpools::ID)]
+    pub pools_program: UncheckedAccount<'info>,
+    /// CHECK: the coin's pool, checked against the launch
+    #[account(mut)]
+    pub pool: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    pub pool_vault_auth: UncheckedAccount<'info>,
+    /// CHECK: checked in the handler
+    #[account(mut)]
+    pub pool_sol_vault: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]

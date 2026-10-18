@@ -68,3 +68,15 @@ cd tests-litesvm && ./fetch-fixtures.sh && cargo test --release
 ## Security
 
 Please report vulnerabilities privately to team@velvetlaunch.xyz rather than opening a public issue.
+
+## Velvet Pools (`programs/velvet-pools`)
+
+The pools coins bond into: one locked SOL/coin pool per bonded coin, created only by the launchpad,
+with a 0.35% swap fee charged in SOL (0.20% stays in the pool; 0.15% goes in equal parts to the
+coin's holders, its creator and Velvet). No LP tokens and no withdraw: the liquidity is permanent.
+Program ID `VPkPeiAg7LheTtDdBByCmXewabF9zF6yK5YYLmfPjWb`.
+
+Derived from [raydium-io/raydium-cp-swap](https://github.com/raydium-io/raydium-cp-swap) at commit
+`0f86d46`, under the Apache License 2.0 (see `programs/velvet-pools/LICENSE`). Modified files carry a
+notice at the top.
+
