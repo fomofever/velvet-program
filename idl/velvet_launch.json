@@ -4,8 +4,7 @@
     "name": "velvet_launch",
     "version": "0.1.0",
     "spec": "0.1.0",
-    "description": "Velvet Launch: anti-snipe Solana launchpad (velvetlaunch.xyz). Source: github.com/fomofever/velvet-program",
-    "repository": "https://github.com/fomofever/velvet-program"
+    "description": "Anti-snipe fair launchpad: PDA-owned mints, atomic creator buy, uniform-price batch auction opening, decaying snipe fee"
   },
   "instructions": [
     {
@@ -77,6 +76,48 @@
                   102,
                   105,
                   103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "apply_config_ext",
+      "docs": [
+        "Anyone can apply the queued extra settings once the timelock has passed."
+      ],
+      "discriminator": [
+        89,
+        130,
+        208,
+        179,
+        37,
+        183,
+        61,
+        24
+      ],
+      "accounts": [
+        {
+          "name": "config_ext",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  101,
+                  120,
+                  116
                 ]
               }
             ]
@@ -374,6 +415,27 @@
               }
             ]
           }
+        },
+        {
+          "name": "pass",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  115,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "user"
+              }
+            ]
+          }
         }
       ],
       "args": [
@@ -421,6 +483,70 @@
                   102,
                   105,
                   103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "cancel_config_ext",
+      "discriminator": [
+        218,
+        8,
+        191,
+        223,
+        144,
+        98,
+        5,
+        154
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "config_ext",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  101,
+                  120,
+                  116
                 ]
               }
             ]
@@ -482,6 +608,9 @@
         },
         {
           "name": "commitment",
+          "docs": [
+            "to this launch and user, and the handler checks owner, discriminator and fields."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -698,6 +827,27 @@
         {
           "name": "system_program",
           "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "pass",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  115,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "user"
+              }
+            ]
+          }
         }
       ],
       "args": []
@@ -2378,6 +2528,87 @@
       ]
     },
     {
+      "name": "init_config_ext",
+      "docs": [
+        "Create the extra settings account (once). Its values then change only through the timelock."
+      ],
+      "discriminator": [
+        254,
+        179,
+        203,
+        67,
+        196,
+        133,
+        160,
+        52
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "config_ext",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  101,
+                  120,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "ExtParams"
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "lock_liquidity",
       "docs": [
         "Permissionless, step 3 (second transaction): lock all LP with Raydium's",
@@ -2685,6 +2916,79 @@
         {
           "name": "timelock_secs",
           "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "propose_config_ext",
+      "discriminator": [
+        133,
+        220,
+        66,
+        42,
+        211,
+        190,
+        171,
+        123
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "config_ext",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  101,
+                  120,
+                  116
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "ExtParams"
+            }
+          }
         }
       ]
     },
@@ -3248,6 +3552,27 @@
               }
             ]
           }
+        },
+        {
+          "name": "pass",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  115,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "user"
+              }
+            ]
+          }
         }
       ],
       "args": [
@@ -3380,6 +3705,28 @@
               }
             ]
           }
+        },
+        {
+          "name": "config_ext",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  101,
+                  120,
+                  116
+                ]
+              }
+            ]
+          }
         }
       ],
       "args": []
@@ -3460,6 +3807,19 @@
       ]
     },
     {
+      "name": "ConfigExt",
+      "discriminator": [
+        135,
+        106,
+        214,
+        0,
+        226,
+        103,
+        230,
+        162
+      ]
+    },
+    {
       "name": "Launch",
       "discriminator": [
         144,
@@ -3470,6 +3830,19 @@
         85,
         213,
         38
+      ]
+    },
+    {
+      "name": "Pass",
+      "discriminator": [
+        40,
+        247,
+        140,
+        113,
+        56,
+        14,
+        57,
+        44
       ]
     }
   ],
@@ -3537,6 +3910,32 @@
         125,
         184,
         13
+      ]
+    },
+    {
+      "name": "ConfigExtApplied",
+      "discriminator": [
+        66,
+        161,
+        66,
+        225,
+        34,
+        110,
+        132,
+        144
+      ]
+    },
+    {
+      "name": "ConfigExtProposed",
+      "discriminator": [
+        9,
+        15,
+        229,
+        40,
+        174,
+        11,
+        44,
+        9
       ]
     },
     {
@@ -3641,6 +4040,19 @@
         39,
         238,
         96
+      ]
+    },
+    {
+      "name": "PassUpdated",
+      "discriminator": [
+        0,
+        16,
+        85,
+        133,
+        138,
+        247,
+        64,
+        254
       ]
     },
     {
@@ -3901,6 +4313,16 @@
       "code": 6040,
       "name": "WrongStorageWallet",
       "msg": "Wrong storage wallet"
+    },
+    {
+      "code": 6041,
+      "name": "CurveFillTooEarly",
+      "msg": "The curve can't be completed while the cover charge is still on: buy a little less, or wait a minute"
+    },
+    {
+      "code": 6042,
+      "name": "BadCommitment",
+      "msg": "Bad commitment account"
     }
   ],
   "types": [
@@ -3996,6 +4418,20 @@
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "claimed",
+            "docs": [
+              "Line tokens already claimed (claims can be partial while a big line unlocks)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "refunded",
+            "docs": [
+              "The overfill refund has been paid."
+            ],
+            "type": "bool"
           }
         ]
       }
@@ -4239,6 +4675,83 @@
       }
     },
     {
+      "name": "ConfigExt",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "params",
+            "type": {
+              "defined": {
+                "name": "ExtParams"
+              }
+            }
+          },
+          {
+            "name": "pending",
+            "type": {
+              "defined": {
+                "name": "ExtParams"
+              }
+            }
+          },
+          {
+            "name": "pending_eta",
+            "type": "i64"
+          },
+          {
+            "name": "_reserved",
+            "type": {
+              "array": [
+                "u8",
+                128
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ConfigExtApplied",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "params",
+            "type": {
+              "defined": {
+                "name": "ExtParams"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ConfigExtProposed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "eta",
+            "type": "i64"
+          },
+          {
+            "name": "params",
+            "type": {
+              "defined": {
+                "name": "ExtParams"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
       "name": "ConfigParams",
       "type": {
         "kind": "struct",
@@ -4401,6 +4914,59 @@
           {
             "name": "total_claimed",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ExtParams",
+      "docs": [
+        "Extra settings that didn't fit the original Config, behind the same timelock."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "big_line_sol",
+            "docs": [
+              "A line that puts more than this into the curve unlocks gradually."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "big_line_unlock_bps",
+            "docs": [
+              "Share of each big-line spot claimable when the doors open (bps)."
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "big_line_vest_secs",
+            "docs": [
+              "The rest unlocks linearly over this long."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "_spare",
+            "docs": [
+              "Room for later settings without moving the layout."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "_spare2",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
           }
         ]
       }
@@ -4654,11 +5220,25 @@
             "type": "u64"
           },
           {
+            "name": "line_unlock_bps",
+            "docs": [
+              "Line unlock schedule, fixed at settle (0 secs = everything claimable at once). Big lines",
+              "(see ConfigExt) unlock `line_unlock_bps` at open and the rest linearly over",
+              "`line_vest_secs` from `vest_start`. Carved out of the old 64 reserved bytes, so launches",
+              "settled before read as \"no vesting\"."
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "line_vest_secs",
+            "type": "u32"
+          },
+          {
             "name": "_reserved",
             "type": {
               "array": [
                 "u8",
-                64
+                58
               ]
             }
           }
@@ -4769,6 +5349,86 @@
           {
             "name": "lp_burned",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Pass",
+      "docs": [
+        "Velvet Pass: a wallet's record across every Velvet coin, kept by the program.",
+        "Tiers: 0 Guest, 1 Regular (3+ lines), 2 VIP (10+ lines and 5+ SOL put in, no recent flip).",
+        "A line counts once, when its tokens are first claimed, if the wallet put in at least",
+        "PASS_MIN_LINE_SOL and the launch went ahead. A \"flip\" is a sell while the cover charge is still",
+        "on: it drops the wallet one tier until it has PASS_HEAL_LINES more clean lines."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "lines",
+            "type": "u32"
+          },
+          {
+            "name": "sol_in_lines",
+            "type": "u64"
+          },
+          {
+            "name": "flips",
+            "type": "u32"
+          },
+          {
+            "name": "flip_pending",
+            "type": "bool"
+          },
+          {
+            "name": "clean_since_flip",
+            "type": "u16"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "_reserved",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "PassUpdated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "lines",
+            "type": "u32"
+          },
+          {
+            "name": "sol_in_lines",
+            "type": "u64"
+          },
+          {
+            "name": "flips",
+            "type": "u32"
+          },
+          {
+            "name": "tier",
+            "type": "u8"
           }
         ]
       }
