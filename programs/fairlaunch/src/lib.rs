@@ -229,7 +229,7 @@ fn close_account<'info>(info: &AccountInfo<'info>, to: &AccountInfo<'info>) -> R
 /// While the cover charge is still above the base fee, nothing may complete the curve: the coin
 /// can only bond (and leave the cover charge behind) after it.
 fn in_cover_window(cfg: &Config, l: &Launch, slot: u64) -> bool {
-    cfg.decay_slots > 0 && slot < l.trading_start_slot.saturating_add(cfg.decay_slots)
+    cfg.decay_slots > 0 && cfg.max_snipe_fee_bps > cfg.base_fee_bps && slot < l.trading_start_slot.saturating_add(cfg.decay_slots)
 }
 
 /// Fill in a freshly created Pass (init_if_needed leaves it zeroed).
@@ -703,11 +703,31 @@ pub mod fairlaunch {
         let slot = Clock::get()?.slot;
         let l = &mut ctx.accounts.launch;
         require!(!l.settled && slot < l.auction_end_slot, FairError::AuctionClosed);
-        let c = &mut ctx.accounts.commitment;
+        let info = ctx.accounts.commitment.to_account_info();
+        let user_info = ctx.accounts.user.to_account_info();
+        let system_info = ctx.accounts.system_program.to_account_info();
+        let mut c = if info.owner == &crate::ID {
+            // Existing commitment, in either layout.
+            read_commitment(&info)?
+        } else {
+            // First commit from this wallet: create the account at its PDA.
+            let space = 8 + Commitment::INIT_SPACE;
+            let rent = Rent::get()?.minimum_balance(space);
+            let lk = l.key();
+            let uk = ctx.accounts.user.key();
+            let bump = ctx.bumps.commitment;
+            let seeds: &[&[u8]] = &[COMMIT_SEED, lk.as_ref(), uk.as_ref(), &[bump]];
+            let have = info.lamports();
+            if have < rent {
+                pay_from_user(&system_info, &user_info, &info, rent - have)?;
+            }
+            anchor_lang::system_program::allocate(CpiContext::new_with_signer(system_info.clone(), anchor_lang::system_program::Allocate { account_to_allocate: info.clone() }, &[seeds]), space as u64)?;
+            anchor_lang::system_program::assign(CpiContext::new_with_signer(system_info.clone(), anchor_lang::system_program::Assign { account_to_assign: info.clone() }, &[seeds]), &crate::ID)?;
+            info.try_borrow_mut_data()?[..8].copy_from_slice(Commitment::DISCRIMINATOR);
+            Commitment { launch: lk, owner: uk, amount: 0, bump, claimed: 0, refunded: false }
+        };
+        require!(c.launch == l.key() && c.owner == ctx.accounts.user.key(), FairError::BadCommitment);
         if c.amount == 0 {
-            c.launch = l.key();
-            c.owner = ctx.accounts.user.key();
-            c.bump = ctx.bumps.commitment;
             l.committers = l.committers.checked_add(1).ok_or(FairError::Overflow)?;
         }
         let new_amount = c.amount.checked_add(lamports).ok_or(FairError::Overflow)?;
@@ -723,6 +743,7 @@ pub mod fairlaunch {
         }
         pay_from_user(&ctx.accounts.system_program.to_account_info(), &ctx.accounts.user.to_account_info(), &l.to_account_info(), lamports)?;
         c.amount = new_amount;
+        write_commitment(&info, &c, &user_info, &system_info)?;
         l.total_committed = l.total_committed.checked_add(lamports).ok_or(FairError::Overflow)?;
         l.escrow_sol = l.escrow_sol.checked_add(lamports).ok_or(FairError::Overflow)?;
         emit!(Committed { launch: l.key(), user: c.owner, amount: lamports, user_total: c.amount, launch_total: l.total_committed });
@@ -835,7 +856,13 @@ pub mod fairlaunch {
         // in enough.
         let first = c.claimed == 0 && !c.refunded;
         touch_pass(&mut ctx.accounts.pass, ctx.accounts.user.key(), ctx.bumps.pass);
-        if first && !l.cancelled && share > 0 && amt.saturating_sub(refund_total) >= PASS_MIN_LINE_SOL {
+        // Only lines in real launches count: not the creator's own coin, and the line had enough
+        // wallets and SOL in it (so a wallet can't farm VIP with throwaway coins of its own).
+        let ext = &ctx.accounts.config_ext.params;
+        let min_committers = if ext.pass_min_committers == 0 { PASS_DEFAULT_MIN_COMMITTERS } else { ext.pass_min_committers };
+        let min_total = if ext.pass_min_line_total == 0 { PASS_DEFAULT_MIN_LINE_TOTAL } else { ext.pass_min_line_total };
+        let real_launch = c.owner != l.creator && l.committers >= min_committers as u32 && l.total_committed >= min_total;
+        if first && real_launch && !l.cancelled && share > 0 && amt.saturating_sub(refund_total) >= PASS_MIN_LINE_SOL {
             let p = &mut ctx.accounts.pass;
             p.lines = p.lines.saturating_add(1);
             p.sol_in_lines = p.sol_in_lines.saturating_add(amt.saturating_sub(refund_total));
@@ -1262,9 +1289,13 @@ pub mod fairlaunch {
         grad_signer!(launch_key, grad_bump, gsig);
         let system = a.system_program.to_account_info();
         let token_prog = a.token_program.to_account_info();
-        let lp_reserve = a.launch.lp_reserve;
         let pool_sol = a.launch.grad_pool_sol;
         let grad_fee = a.launch.grad_fee_paid;
+        // The pool opens at the curve's last price: tokens beyond what pool_sol buys at that price
+        // are burned, so nobody can buy the gap right after graduation.
+        let at_price = (pool_sol as u128).checked_mul(a.launch.virtual_token as u128).ok_or(FairError::Overflow)? / (a.launch.virtual_sol as u128).max(1);
+        let lp_reserve = (a.launch.lp_reserve as u128).min(at_price) as u64;
+        let burn = a.launch.lp_reserve - lp_reserve;
 
         for (ata, m) in [(a.grad_wsol.to_account_info(), a.wsol_mint.to_account_info()), (a.grad_token.to_account_info(), a.mint.to_account_info())] {
             associated_token::create_idempotent(CpiContext::new_with_signer(
@@ -1282,6 +1313,18 @@ pub mod fairlaunch {
         }
         pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.grad_wsol.to_account_info(), pool_sol, gsig)?;
         token::sync_native(CpiContext::new(token_prog.clone(), token::SyncNative { account: a.grad_wsol.to_account_info() }))?;
+        if burn > 0 {
+            let l = &a.launch;
+            launch_signer!(l, lsig);
+            token::burn(
+                CpiContext::new_with_signer(
+                    token_prog.clone(),
+                    token::Burn { mint: a.mint.to_account_info(), from: a.vault.to_account_info(), authority: l.to_account_info() },
+                    lsig,
+                ),
+                burn,
+            )?;
+        }
         {
             let l = &a.launch;
             launch_signer!(l, lsig);
@@ -1344,6 +1387,8 @@ pub mod fairlaunch {
         grad_signer!(launch_key, grad_bump, gsig);
         let system = a.system_program.to_account_info();
         let token_prog = a.token_program.to_account_info();
+        let wsol_created = a.grad_wsol.to_account_info().data_is_empty();
+        let wsol_rent = Rent::get()?.minimum_balance(spl_token::state::Account::LEN);
         associated_token::create_idempotent(CpiContext::new(
             a.associated_token_program.to_account_info(),
             associated_token::Create {
@@ -1370,15 +1415,24 @@ pub mod fairlaunch {
             token::CloseAccount { account: a.grad_wsol.to_account_info(), destination: a.grad_auth.to_account_info(), authority: a.grad_auth.to_account_info() },
             gsig,
         ))?;
-        let to_holders = sol / 3;
-        let to_creator = sol / 3;
+        let mut to_holders = sol / 3;
+        let mut to_creator = sol / 3;
         let to_treasury = sol - to_holders - to_creator;
+        // An empty creator wallet can't receive less than the rent minimum: that third goes to
+        // holders this time rather than blocking the collection.
+        if a.creator.lamports() == 0 && to_creator < Rent::get()?.minimum_balance(0) {
+            to_holders += to_creator;
+            to_creator = 0;
+        }
         pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.creator.to_account_info(), to_creator, gsig)?;
         pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.launch.to_account_info(), to_holders, gsig)?;
         pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.treasury.to_account_info(), to_treasury, gsig)?;
-        // The WSOL account's rent (paid by `payer` when it had to be created) goes back to them.
-        let rent_back = a.grad_auth.lamports().saturating_sub(GRAD_AUTH_FLOAT);
+        // The WSOL account's rent goes back to `payer` only if they paid it just now; anything else
+        // that turned up in the authority (stray transfers) goes to the treasury.
+        let extra = a.grad_auth.lamports().saturating_sub(GRAD_AUTH_FLOAT);
+        let rent_back = if wsol_created { extra.min(wsol_rent) } else { 0 };
         pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.payer.to_account_info(), rent_back, gsig)?;
+        pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.treasury.to_account_info(), extra - rent_back, gsig)?;
         let l = &mut ctx.accounts.launch;
         l.reward_sol = l.reward_sol.checked_add(to_holders).ok_or(FairError::Overflow)?;
         l.pool_fees_collected = l.pool_fees_collected.checked_add(sol).ok_or(FairError::Overflow)?;
@@ -1772,8 +1826,10 @@ pub struct Commit<'info> {
     pub config: Box<Account<'info, Config>>,
     #[account(mut, seeds = [LAUNCH_SEED, launch.mint.as_ref()], bump = launch.bump)]
     pub launch: Box<Account<'info, Launch>>,
-    #[account(init_if_needed, payer = user, space = 8 + Commitment::INIT_SPACE, seeds = [COMMIT_SEED, launch.key().as_ref(), user.key().as_ref()], bump)]
-    pub commitment: Box<Account<'info, Commitment>>,
+    /// CHECK: created or read by hand (so commitments from before partial claims can still be
+    /// topped up); the seeds pin it to this launch and user, the handler checks the rest.
+    #[account(mut, seeds = [COMMIT_SEED, launch.key().as_ref(), user.key().as_ref()], bump)]
+    pub commitment: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1836,6 +1892,8 @@ pub struct Claim<'info> {
     pub system_program: Program<'info, System>,
     #[account(init_if_needed, payer = user, space = 8 + Pass::INIT_SPACE, seeds = [PASS_SEED, user.key().as_ref()], bump)]
     pub pass: Box<Account<'info, Pass>>,
+    #[account(seeds = [CONFIG_EXT_SEED], bump = config_ext.bump)]
+    pub config_ext: Box<Account<'info, ConfigExt>>,
 }
 
 #[derive(Accounts)]
@@ -1990,6 +2048,7 @@ pub struct GraduateVelvet<'info> {
     pub treasury: UncheckedAccount<'info>,
     #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
     pub launch: Box<Account<'info, Launch>>,
+    #[account(mut)]
     pub mint: Box<Account<'info, Mint>>,
     #[account(mut, associated_token::mint = mint, associated_token::authority = launch)]
     pub vault: Box<Account<'info, TokenAccount>>,

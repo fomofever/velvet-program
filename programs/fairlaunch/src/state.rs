@@ -278,6 +278,9 @@ pub struct Pass {
 
 pub const PASS_SEED: &[u8] = b"pass";
 pub const PASS_MIN_LINE_SOL: u64 = 100_000_000;
+/// Defaults for the "real launch" test a line must pass to count (see ExtParams).
+pub const PASS_DEFAULT_MIN_COMMITTERS: u16 = 10;
+pub const PASS_DEFAULT_MIN_LINE_TOTAL: u64 = 10_000_000_000;
 pub const PASS_REGULAR_LINES: u32 = 3;
 pub const PASS_VIP_LINES: u32 = 10;
 pub const PASS_VIP_SOL: u64 = 5_000_000_000;
@@ -312,8 +315,13 @@ pub struct ExtParams {
     pub big_line_vest_secs: u32,
     /// New coins bond into Velvet Pools instead of Raydium.
     pub velvet_pools: bool,
+    /// Velvet Pass: a line only counts in a launch with at least this many wallets in its line
+    /// (0 = PASS_DEFAULT_MIN_COMMITTERS).
+    pub pass_min_committers: u16,
+    /// ...and at least this much SOL in its line in total (0 = PASS_DEFAULT_MIN_LINE_TOTAL).
+    pub pass_min_line_total: u64,
     /// Room for later settings without moving the layout.
-    pub _spare: [u8; 31],
+    pub _spare: [u8; 21],
     pub _spare2: [u8; 32],
 }
 

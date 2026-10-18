@@ -120,7 +120,7 @@ fn init_config_ix(env_config: Pubkey, authority: &Pubkey, p: ConfigParams) -> In
 
 fn setup() -> Env { setup_with(|_| {}) }
 fn setup_with(tweak: impl Fn(&mut ConfigParams)) -> Env {
-    setup_full(tweak, ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, big_line_vest_secs: 0, ..Default::default() })
+    setup_full(tweak, ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, big_line_vest_secs: 0, pass_min_committers: 1, pass_min_line_total: 1, ..Default::default() })
 }
 fn setup_ext(ext: ExtParams) -> Env { setup_full(|_| {}, ext) }
 fn setup_full(tweak: impl Fn(&mut ConfigParams), ext: ExtParams) -> Env {
@@ -267,7 +267,7 @@ fn claim(env: &mut Env, l: &L, u: &Keypair) -> Result<(), String> {
         accounts: fairlaunch::accounts::Claim {
             user: u.pubkey(), launch: l.launch, mint: l.mint, commitment, vault: l.vault, user_ata: ata(&u.pubkey(), &l.mint),
             token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID,
-            pass: pass_pda(&u.pubkey()),
+            pass: pass_pda(&u.pubkey()), config_ext: ext_pda(),
         }.to_account_metas(None),
         data: fairlaunch::instruction::Claim {}.data(),
     };
@@ -1397,7 +1397,7 @@ fn every_new_coin_pays_the_storage_fee_to_the_storage_wallet() {
 
 // ───────────────────────────── anti-dump ─────────────────────────────
 
-fn big_line_ext() -> ExtParams { ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 2_500, big_line_vest_secs: 3_600, ..Default::default() } }
+fn big_line_ext() -> ExtParams { ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 2_500, big_line_vest_secs: 3_600, pass_min_committers: 1, pass_min_line_total: 1, ..Default::default() } }
 fn commit_pda(l: &L, u: &Pubkey) -> Pubkey { Pubkey::find_program_address(&[COMMIT_SEED, l.launch.as_ref(), u.as_ref()], &pid()).0 }
 fn share_of(env: &Env, l: &L, committed: u64) -> u64 {
     let s = launch_state(&env.svm, &l.launch);
@@ -1647,7 +1647,7 @@ fn vips_pay_half_the_cover_charge() {
 // ───────────────────────────── Velvet Pools ─────────────────────────────
 
 use fairlaunch::vpools;
-fn vp_ext() -> ExtParams { ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, big_line_vest_secs: 0, velvet_pools: true, ..Default::default() } }
+fn vp_ext() -> ExtParams { ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, big_line_vest_secs: 0, velvet_pools: true, pass_min_committers: 1, pass_min_line_total: 1, ..Default::default() } }
 fn grad_of(l: &L) -> Pubkey { Pubkey::find_program_address(&[GRAD_SEED, l.launch.as_ref()], &pid()).0 }
 
 /// A coin that fills its curve and bonds into Velvet Pools.
@@ -1743,12 +1743,12 @@ fn coins_bond_into_velvet_pools_with_locked_liquidity() {
     assert_eq!(env.svm.get_account(&pool).unwrap().owner, vpools::ID);
     let sv = tok(&env.svm, &vpools::vault(&pool, &wsol()));
     let tv = tok(&env.svm, &vpools::vault(&pool, &l.mint));
-    assert_eq!(tv, s.lp_reserve, "the whole LP reserve is in the pool");
+    assert!(tv <= s.lp_reserve, "at most the LP reserve is in the pool (the excess is burned)");
     assert_eq!(sv, s.grad_pool_sol, "the curve's SOL is in the pool");
     let curve_end = s.virtual_sol as f64 / s.virtual_token as f64;
     let pool_price = sv as f64 / tv as f64;
     println!("velvet pool: {:.2} SOL, {:.1}M tokens, gap to curve {:.2}%", sv as f64 / 1e9, tv as f64 / 1e12, (1.0 - pool_price / curve_end) * 100.0);
-    assert!(pool_price <= curve_end && pool_price > curve_end * 0.9);
+    assert!((pool_price / curve_end - 1.0).abs() < 1e-6, "the pool opens at the curve's last price");
     // The Raydium path is closed while Velvet Pools is on.
     let late = user(&mut env.svm, 5);
     let _ = ws;
@@ -1848,3 +1848,48 @@ fn hold_streak_payouts_work_after_bonding_into_velvet_pools() {
     assert_eq!(bal(&env.svm, &ws[0].pubkey()) - b0, pool / 50);
 }
 
+
+/// Audit M-1: a wallet can't farm VIP with throwaway coins. With the default thresholds, lines in
+/// launches with few wallets or little SOL don't count, and a creator's own line never counts.
+#[test]
+fn velvet_pass_ignores_throwaway_and_own_launches() {
+    let mut env = setup_ext(ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, ..Default::default() });
+    let w = user(&mut env.svm, 60);
+    for i in 0..10 { run_line(&mut env, 130 + i, &w, SOL / 2); }
+    assert_eq!(pass_of(&env, &w.pubkey()).unwrap().lines, 0, "solo lines in tiny launches don't count");
+
+    // A real launch: 10 wallets, 10+ SOL. Everyone but the creator gets a line.
+    let creator = user(&mut env.svm, 20);
+    let l = create(&mut env, &creator, seed(150), 0, 0, 0).unwrap();
+    let ws: Vec<Keypair> = (0..10).map(|_| user(&mut env.svm, 5)).collect();
+    commit(&mut env, &l, &creator, SOL).unwrap();
+    for x in &ws { commit(&mut env, &l, x, SOL).unwrap(); }
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &creator).unwrap();
+    for x in &ws { claim(&mut env, &l, x).unwrap(); }
+    claim(&mut env, &l, &creator).unwrap();
+    assert_eq!(pass_of(&env, &ws[0].pubkey()).unwrap().lines, 1);
+    assert_eq!(pass_of(&env, &creator.pubkey()).unwrap().lines, 0, "creator's own line doesn't count");
+}
+
+/// Audit L-1: a wallet with a commitment in the old 81-byte layout can still top it up.
+#[test]
+fn old_layout_commitment_can_top_up() {
+    let mut env = setup();
+    let creator = user(&mut env.svm, 5);
+    let w = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(160), 0, 0, 0).unwrap();
+    commit(&mut env, &l, &w, SOL / 2).unwrap();
+    let (cp, _) = Pubkey::find_program_address(&[COMMIT_SEED, l.launch.as_ref(), w.pubkey().as_ref()], &pid());
+    let mut a = env.svm.get_account(&cp).unwrap();
+    a.data.truncate(fairlaunch::state::COMMITMENT_V1_LEN);
+    env.svm.set_account(cp, a).unwrap();
+    commit(&mut env, &l, &w, SOL / 2).unwrap();
+    let a = env.svm.get_account(&cp).unwrap();
+    assert_eq!(a.data.len(), 8 + <Commitment as anchor_lang::Space>::INIT_SPACE);
+    let c = Commitment::try_deserialize(&mut a.data.as_slice()).unwrap();
+    assert_eq!(c.amount, SOL);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &creator).unwrap();
+    claim(&mut env, &l, &w).unwrap();
+}

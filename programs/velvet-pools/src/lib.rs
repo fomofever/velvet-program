@@ -49,6 +49,8 @@ pub mod velvet_pools {
         require!(sol_amount > 0 && token_amount > 0, PoolError::EmptySupply);
         require_keys_eq!(ctx.accounts.wsol_mint.key(), token::spl_token::native_mint::ID, PoolError::WrongMint);
         require_keys_neq!(ctx.accounts.token_mint.key(), ctx.accounts.wsol_mint.key(), PoolError::WrongMint);
+        // Nobody may be able to freeze holders' tokens (or the pool's own vault).
+        require!(ctx.accounts.token_mint.freeze_authority.is_none(), PoolError::WrongMint);
 
         let tp = ctx.accounts.token_program.to_account_info();
         token::transfer(
