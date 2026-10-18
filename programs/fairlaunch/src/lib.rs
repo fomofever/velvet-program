@@ -574,6 +574,7 @@ pub mod fairlaunch {
         vest_secs: i64,
     ) -> Result<()> {
         let cfg = &ctx.accounts.config;
+        require!(ctx.accounts.config_ext.params.allow_any_mint || math::b58_ends_with(&ctx.accounts.mint.key().to_bytes(), VANITY_SUFFIX), FairError::NotVanityMint);
         require!(creator_buy_lamports <= cfg.max_creator_buy, FairError::CreatorBuyTooLarge);
         require_keys_eq!(ctx.accounts.treasury.key(), cfg.treasury, FairError::WrongTreasury);
         let (bump, mint_bump) = (ctx.bumps.launch, ctx.bumps.mint);
@@ -654,6 +655,7 @@ pub mod fairlaunch {
         expires_at: i64,
         creator: Pubkey,
     ) -> Result<()> {
+        require!(ctx.accounts.config_ext.params.allow_any_mint || math::b58_ends_with(&ctx.accounts.mint.key().to_bytes(), VANITY_SUFFIX), FairError::NotVanityMint);
         let now = Clock::get()?.unix_timestamp;
         require!(now <= expires_at, FairError::ApprovalExpired);
         require!(expires_at <= now.saturating_add(MAX_APPROVAL_SECS), FairError::BadApproval);
@@ -1784,6 +1786,8 @@ pub struct CreateLaunch<'info> {
     /// CHECK: checked against config.storage_wallet when storage is on
     #[account(mut)]
     pub storage: UncheckedAccount<'info>,
+    #[account(seeds = [CONFIG_EXT_SEED], bump = config_ext.bump)]
+    pub config_ext: Box<Account<'info, ConfigExt>>,
 }
 
 #[derive(Accounts)]
@@ -1816,6 +1820,8 @@ pub struct CreateLaunchSigned<'info> {
     /// CHECK: checked against config.storage_wallet when storage is on
     #[account(mut)]
     pub storage: UncheckedAccount<'info>,
+    #[account(seeds = [CONFIG_EXT_SEED], bump = config_ext.bump)]
+    pub config_ext: Box<Account<'info, ConfigExt>>,
 }
 
 #[derive(Accounts)]

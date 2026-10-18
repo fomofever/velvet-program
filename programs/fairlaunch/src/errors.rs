@@ -90,6 +90,8 @@ pub enum FairError {
     CurveFillTooEarly,
     #[msg("Bad commitment account")]
     BadCommitment,
+    #[msg("A Velvet coin's address must end in vLvt")]
+    NotVanityMint,
 }
 
 impl From<MathError> for FairError {

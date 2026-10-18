@@ -189,6 +189,52 @@ pub fn lp_for_deposit(a: u64, b: u64, ra: u64, rb: u64, supply: u64) -> (u64, u6
     (lp as u64, need(lp, ra) as u64, need(lp, rb) as u64)
 }
 
+/// Whether a 32-byte key's base58 form ends in `suffix`, without encoding the whole key: the last
+/// n base58 digits are the key (as a big-endian number) mod 58^n.
+pub fn b58_ends_with(key: &[u8; 32], suffix: &[u8]) -> bool {
+    const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let n = suffix.len();
+    if n == 0 { return true; }
+    if n > 8 { return false; }
+    let m = 58u128.pow(n as u32);
+    let mut r: u128 = 0;
+    for b in key { r = (r * 256 + *b as u128) % m; }
+    // A key too small to have n digits can't end in them (never happens for real addresses).
+    let mut big = false;
+    { let mut q: u128 = 0; for b in key { q = q * 256 + *b as u128; if q >= m { big = true; break; } } }
+    if !big { return false; }
+    for i in (0..n).rev() {
+        if ALPHABET[(r % 58) as usize] != suffix[i] { return false; }
+        r /= 58;
+    }
+    true
+}
+
+#[cfg(test)]
+mod b58_tests {
+    use super::*;
+    use anchor_lang::prelude::Pubkey;
+    #[test]
+    fn suffix_matches_full_encoding() {
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        for _ in 0..20_000 {
+            let mut k = [0u8; 32];
+            for b in k.iter_mut() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; *b = x as u8; }
+            if x % 7 == 0 { k[0] = 0; k[1] = 0; }
+            let s = Pubkey::new_from_array(k).to_string();
+            for n in 1..=5 {
+                let suf = &s.as_bytes()[s.len() - n..];
+                assert!(b58_ends_with(&k, suf), "{s} {n}");
+                let mut wrong = suf.to_vec(); wrong[0] = if wrong[0] == b'z' { b'y' } else { b'z' };
+                assert!(!b58_ends_with(&k, &wrong));
+            }
+        }
+        let v: Pubkey = "88ULVT4Nq8TEkoVGGqnjJHQUvNT5bw5Dd3f2rxBnvLvt".parse().unwrap();
+        assert!(b58_ends_with(&v.to_bytes(), b"vLvt"));
+        assert!(!b58_ends_with(&[0u8; 32], b"1"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

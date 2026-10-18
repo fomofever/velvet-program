@@ -120,7 +120,7 @@ fn init_config_ix(env_config: Pubkey, authority: &Pubkey, p: ConfigParams) -> In
 
 fn setup() -> Env { setup_with(|_| {}) }
 fn setup_with(tweak: impl Fn(&mut ConfigParams)) -> Env {
-    setup_full(tweak, ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, big_line_vest_secs: 0, pass_min_committers: 1, pass_min_line_total: 1, ..Default::default() })
+    setup_full(tweak, ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, big_line_vest_secs: 0, pass_min_committers: 1, pass_min_line_total: 1, allow_any_mint: true, ..Default::default() })
 }
 fn setup_ext(ext: ExtParams) -> Env { setup_full(|_| {}, ext) }
 fn setup_full(tweak: impl Fn(&mut ConfigParams), ext: ExtParams) -> Env {
@@ -232,7 +232,7 @@ fn create(env: &mut Env, creator: &Keypair, seed: [u8; 16], buy: u64, min_raise:
         accounts: fairlaunch::accounts::CreateLaunch {
             creator: creator.pubkey(), config: env.config, treasury: env.treasury, mint, launch, vault, escrow, metadata,
             metadata_program: mpl(), token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID,
-            system_program: system_program::ID, rent: sysvar::rent::ID, storage: env.storage,
+            system_program: system_program::ID, rent: sysvar::rent::ID, storage: env.storage, config_ext: ext_pda(),
         }.to_account_metas(None),
         data: fairlaunch::instruction::CreateLaunch {
             seed, name: "Velvet Test".into(), symbol: "VTEST".into(), uri: "https://velvet.example/m/x.json".into(),
@@ -725,7 +725,7 @@ fn free_ixs(env: &Env, f: &Free, signer: &Keypair, creator: Pubkey, payer: &Pubk
             payer: *payer, config: env.config, mint: l.mint, launch: l.launch, vault: l.vault, escrow: l.escrow, metadata,
             instructions: sysvar::instructions::ID, metadata_program: mpl(), token_program: spl_token::ID,
             associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID, rent: sysvar::rent::ID,
-            storage: env.storage,
+            storage: env.storage, config_ext: ext_pda(),
         }.to_account_metas(None),
         data: fairlaunch::instruction::CreateLaunchSigned {
             seed: f.seed, name: f.name.into(), symbol: FREE_SYM.into(), uri: FREE_URI.into(), auction_slots: f.auction,
@@ -1397,7 +1397,7 @@ fn every_new_coin_pays_the_storage_fee_to_the_storage_wallet() {
 
 // ───────────────────────────── anti-dump ─────────────────────────────
 
-fn big_line_ext() -> ExtParams { ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 2_500, big_line_vest_secs: 3_600, pass_min_committers: 1, pass_min_line_total: 1, ..Default::default() } }
+fn big_line_ext() -> ExtParams { ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 2_500, big_line_vest_secs: 3_600, pass_min_committers: 1, pass_min_line_total: 1, allow_any_mint: true, ..Default::default() } }
 fn commit_pda(l: &L, u: &Pubkey) -> Pubkey { Pubkey::find_program_address(&[COMMIT_SEED, l.launch.as_ref(), u.as_ref()], &pid()).0 }
 fn share_of(env: &Env, l: &L, committed: u64) -> u64 {
     let s = launch_state(&env.svm, &l.launch);
@@ -1647,7 +1647,7 @@ fn vips_pay_half_the_cover_charge() {
 // ───────────────────────────── Velvet Pools ─────────────────────────────
 
 use fairlaunch::vpools;
-fn vp_ext() -> ExtParams { ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, big_line_vest_secs: 0, velvet_pools: true, pass_min_committers: 1, pass_min_line_total: 1, ..Default::default() } }
+fn vp_ext() -> ExtParams { ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, big_line_vest_secs: 0, velvet_pools: true, pass_min_committers: 1, pass_min_line_total: 1, allow_any_mint: true, ..Default::default() } }
 fn grad_of(l: &L) -> Pubkey { Pubkey::find_program_address(&[GRAD_SEED, l.launch.as_ref()], &pid()).0 }
 
 /// A coin that fills its curve and bonds into Velvet Pools.
@@ -1853,7 +1853,7 @@ fn hold_streak_payouts_work_after_bonding_into_velvet_pools() {
 /// launches with few wallets or little SOL don't count, and a creator's own line never counts.
 #[test]
 fn velvet_pass_ignores_throwaway_and_own_launches() {
-    let mut env = setup_ext(ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, ..Default::default() });
+    let mut env = setup_ext(ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, allow_any_mint: true, ..Default::default() });
     let w = user(&mut env.svm, 60);
     for i in 0..10 { run_line(&mut env, 130 + i, &w, SOL / 2); }
     assert_eq!(pass_of(&env, &w.pubkey()).unwrap().lines, 0, "solo lines in tiny launches don't count");
@@ -1893,3 +1893,17 @@ fn old_layout_commitment_can_top_up() {
     settle(&mut env, &l, &creator).unwrap();
     claim(&mut env, &l, &w).unwrap();
 }
+
+/// Every coin's mint ends in vLvt: a random seed is refused, a ground vanity seed works.
+#[test]
+fn coins_must_have_a_vlvt_address() {
+    let mut env = setup_ext(ExtParams { big_line_sol: 30 * SOL, big_line_unlock_bps: 10_000, ..Default::default() });
+    let creator = user(&mut env.svm, 5);
+    let e = create(&mut env, &creator, seed(170), 0, 0, 0).err().expect("random address refused");
+    assert!(e.contains("NotVanityMint"), "{e}");
+    let mut s = [0u8; 16];
+    s.copy_from_slice(&hex_bytes("5511137133137cae7d0ba89e63b5b17d"));
+    let l = create(&mut env, &creator, s, 0, 0, 0).unwrap();
+    assert!(l.mint.to_string().ends_with("vLvt"), "{}", l.mint);
+}
+fn hex_bytes(h: &str) -> Vec<u8> { (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect() }

@@ -3,6 +3,8 @@ use anchor_lang::prelude::*;
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const LAUNCH_SEED: &[u8] = b"launch";
 pub const MINT_SEED: &[u8] = b"mint";
+/// Every Velvet coin's mint address ends in this (base58), unless ExtParams.allow_any_mint.
+pub const VANITY_SUFFIX: &[u8] = b"vLvt";
 pub const COMMIT_SEED: &[u8] = b"commit";
 pub const ESCROW_SEED: &[u8] = b"escrow";
 pub const GRAD_SEED: &[u8] = b"grad";
@@ -320,8 +322,11 @@ pub struct ExtParams {
     pub pass_min_committers: u16,
     /// ...and at least this much SOL in its line in total (0 = PASS_DEFAULT_MIN_LINE_TOTAL).
     pub pass_min_line_total: u64,
+    /// Let coins launch at any mint address. Off (the default), every coin's mint must end in
+    /// VANITY_SUFFIX.
+    pub allow_any_mint: bool,
     /// Room for later settings without moving the layout.
-    pub _spare: [u8; 21],
+    pub _spare: [u8; 20],
     pub _spare2: [u8; 32],
 }
 
