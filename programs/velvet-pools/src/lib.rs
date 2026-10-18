@@ -1,7 +1,8 @@
 //! Velvet Pools: the constant-product pools coins move into when they bond on Velvet Launch.
 //!
 //! Derived from raydium-io/raydium-cp-swap (Apache-2.0), commit 0f86d46. Modified by Velvet:
-//! - one pair per pool: SOL (wrapped) and the coin, both classic SPL tokens (no Token-2022);
+//! - one pair per pool: SOL (wrapped, classic SPL) and the coin (classic SPL, or Token-2022 with
+//!   only its metadata extensions: no transfer fees, hooks, freezing or other extensions);
 //! - only Velvet Launch can create a pool: the coin's graduation authority (a PDA of the
 //!   launchpad) must sign, so nobody else can create or front-run a coin's pool;
 //! - no LP tokens, no deposit or withdraw: the liquidity a coin bonds with is locked forever;
@@ -13,6 +14,9 @@
 
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+use anchor_spl::token_interface::{
+    self as tokx, spl_token_2022, Mint as CoinMint, TokenAccount as CoinAccount, TokenInterface,
+};
 
 pub mod curve;
 use curve::calculator::CurveCalculator;
@@ -51,15 +55,25 @@ pub mod velvet_pools {
         require_keys_neq!(ctx.accounts.token_mint.key(), ctx.accounts.wsol_mint.key(), PoolError::WrongMint);
         // Nobody may be able to freeze holders' tokens (or the pool's own vault).
         require!(ctx.accounts.token_mint.freeze_authority.is_none(), PoolError::WrongMint);
+        check_coin_extensions(&ctx.accounts.token_mint.to_account_info())?;
 
         let tp = ctx.accounts.token_program.to_account_info();
         token::transfer(
-            CpiContext::new(tp.clone(), Transfer { from: ctx.accounts.creator_sol.to_account_info(), to: ctx.accounts.sol_vault.to_account_info(), authority: ctx.accounts.creator.to_account_info() }),
+            CpiContext::new(tp, Transfer { from: ctx.accounts.creator_sol.to_account_info(), to: ctx.accounts.sol_vault.to_account_info(), authority: ctx.accounts.creator.to_account_info() }),
             sol_amount,
         )?;
-        token::transfer(
-            CpiContext::new(tp, Transfer { from: ctx.accounts.creator_token.to_account_info(), to: ctx.accounts.token_vault.to_account_info(), authority: ctx.accounts.creator.to_account_info() }),
+        tokx::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.coin_token_program.to_account_info(),
+                tokx::TransferChecked {
+                    from: ctx.accounts.creator_token.to_account_info(),
+                    mint: ctx.accounts.token_mint.to_account_info(),
+                    to: ctx.accounts.token_vault.to_account_info(),
+                    authority: ctx.accounts.creator.to_account_info(),
+                },
+            ),
             token_amount,
+            ctx.accounts.token_mint.decimals,
         )?;
 
         let p = &mut ctx.accounts.pool;
@@ -92,16 +106,23 @@ pub mod velvet_pools {
         require!(r.new_sol.checked_mul(r.new_token).ok_or(PoolError::Math)? >= k_before, PoolError::Math);
         require!(r.amount_out >= minimum_amount_out, PoolError::ExceededSlippage);
 
-        let tp = a.token_program.to_account_info();
+        let sol_tp = a.token_program.to_account_info();
+        let coin_tp = a.coin_token_program.to_account_info();
         let auth_seeds: &[&[u8]] = &[AUTH_SEED, &[p.auth_bump]];
         let signer = &[auth_seeds];
-        let (user_in, vault_in, vault_out, user_out) = if buy {
-            (a.user_sol.to_account_info(), a.sol_vault.to_account_info(), a.token_vault.to_account_info(), a.user_token.to_account_info())
+        // Plain transfers work for both token programs here: pools only hold coins without
+        // transfer fees or hooks (checked when the pool was created), and leaving the mint out
+        // keeps swap transactions small.
+        let (in_tp, user_in, vault_in, out_tp, vault_out, user_out) = if buy {
+            (&sol_tp, a.user_sol.to_account_info(), a.sol_vault.to_account_info(), &coin_tp, a.token_vault.to_account_info(), a.user_token.to_account_info())
         } else {
-            (a.user_token.to_account_info(), a.token_vault.to_account_info(), a.sol_vault.to_account_info(), a.user_sol.to_account_info())
+            (&coin_tp, a.user_token.to_account_info(), a.token_vault.to_account_info(), &sol_tp, a.sol_vault.to_account_info(), a.user_sol.to_account_info())
         };
-        token::transfer(CpiContext::new(tp.clone(), Transfer { from: user_in, to: vault_in, authority: a.user.to_account_info() }), amount_in)?;
-        token::transfer(CpiContext::new_with_signer(tp, Transfer { from: vault_out, to: user_out, authority: a.vault_auth.to_account_info() }, signer), r.amount_out)?;
+        #[allow(deprecated)]
+        {
+            tokx::transfer(CpiContext::new(in_tp.clone(), tokx::Transfer { from: user_in, to: vault_in, authority: a.user.to_account_info() }), amount_in)?;
+            tokx::transfer(CpiContext::new_with_signer(out_tp.clone(), tokx::Transfer { from: vault_out, to: user_out, authority: a.vault_auth.to_account_info() }, signer), r.amount_out)?;
+        }
 
         let p = &mut ctx.accounts.pool;
         p.protocol_fees_sol = p.protocol_fees_sol.checked_add(r.protocol_fee).ok_or(PoolError::Math)?;
@@ -142,6 +163,24 @@ pub mod velvet_pools {
     }
 }
 
+/// A Token-2022 coin may only carry its metadata (pointer + the metadata itself): anything else
+/// (transfer fees, hooks, a permanent delegate, confidential transfers…) could take tokens from
+/// the pool or holders, or break swaps.
+fn check_coin_extensions(mint: &AccountInfo) -> Result<()> {
+    if mint.owner == &token::ID {
+        return Ok(());
+    }
+    require_keys_eq!(*mint.owner, spl_token_2022::ID, PoolError::WrongMint);
+    use spl_token_2022::extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensions};
+    let data = mint.try_borrow_data()?;
+    let state = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&data).map_err(|_| error!(PoolError::WrongMint))?;
+    let types = state.get_extension_types().map_err(|_| error!(PoolError::WrongMint))?;
+    for t in types {
+        require!(matches!(t, ExtensionType::MetadataPointer | ExtensionType::TokenMetadata), PoolError::WrongMint);
+    }
+    Ok(())
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct Pool {
@@ -168,7 +207,8 @@ pub struct Initialize<'info> {
     /// The coin's graduation authority (a launchpad PDA, checked in the handler); pays the rent.
     #[account(mut)]
     pub creator: Signer<'info>,
-    pub token_mint: Box<Account<'info, Mint>>,
+    #[account(mint::token_program = coin_token_program)]
+    pub token_mint: Box<InterfaceAccount<'info, CoinMint>>,
     pub wsol_mint: Box<Account<'info, Mint>>,
     #[account(init, payer = creator, space = 8 + Pool::INIT_SPACE, seeds = [POOL_SEED, token_mint.key().as_ref()], bump)]
     pub pool: Box<Account<'info, Pool>>,
@@ -177,14 +217,17 @@ pub struct Initialize<'info> {
     pub vault_auth: UncheckedAccount<'info>,
     #[account(init, payer = creator, seeds = [VAULT_SEED, pool.key().as_ref(), wsol_mint.key().as_ref()], bump, token::mint = wsol_mint, token::authority = vault_auth)]
     pub sol_vault: Box<Account<'info, TokenAccount>>,
-    #[account(init, payer = creator, seeds = [VAULT_SEED, pool.key().as_ref(), token_mint.key().as_ref()], bump, token::mint = token_mint, token::authority = vault_auth)]
-    pub token_vault: Box<Account<'info, TokenAccount>>,
+    #[account(init, payer = creator, seeds = [VAULT_SEED, pool.key().as_ref(), token_mint.key().as_ref()], bump, token::mint = token_mint, token::authority = vault_auth, token::token_program = coin_token_program)]
+    pub token_vault: Box<InterfaceAccount<'info, CoinAccount>>,
     #[account(mut, token::mint = wsol_mint, token::authority = creator)]
     pub creator_sol: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = token_mint, token::authority = creator)]
-    pub creator_token: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = token_mint, token::authority = creator, token::token_program = coin_token_program)]
+    pub creator_token: Box<InterfaceAccount<'info, CoinAccount>>,
+    /// Classic token program (wrapped SOL).
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+    /// The coin's token program (classic or Token-2022).
+    pub coin_token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
@@ -197,13 +240,16 @@ pub struct Swap<'info> {
     pub vault_auth: UncheckedAccount<'info>,
     #[account(mut, address = pool.sol_vault)]
     pub sol_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, address = pool.token_vault)]
-    pub token_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = pool.token_vault, token::token_program = coin_token_program)]
+    pub token_vault: Box<InterfaceAccount<'info, CoinAccount>>,
     #[account(mut, token::mint = token::spl_token::native_mint::ID, token::authority = user)]
     pub user_sol: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = pool.token_mint, token::authority = user)]
-    pub user_token: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = pool.token_mint, token::authority = user, token::token_program = coin_token_program)]
+    pub user_token: Box<InterfaceAccount<'info, CoinAccount>>,
+    /// Classic token program (wrapped SOL).
     pub token_program: Program<'info, Token>,
+    /// The coin's token program (classic or Token-2022).
+    pub coin_token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]

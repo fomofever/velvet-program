@@ -25,10 +25,14 @@ is exactly this code.
 - `raydium.rs` — CPIs into Raydium CPMM and the Raydium liquidity locker
 - `state.rs`, `errors.rs` — accounts and error codes
 - `tests-litesvm/` — end-to-end tests against real Raydium, locker and Metaplex bytecode
-  (`./fetch-fixtures.sh` dumps them from devnet), plus a fuzz campaign
+  (`./fetch-fixtures.sh` dumps them from devnet), plus a fuzz campaign; classic-coin tests run
+  the program as deployed before Token-2022 to create their coins, then the current one
 
-Every coin is minted by the program with a fixed 1B supply and minting switched off in the same
-transaction. Openings are a single-price batch (the "line"), early flippers pay a decaying cover
+Every coin is minted by the program as a Token-2022 token with a fixed 1B supply and minting
+switched off in the same transaction. Its name, ticker and logo link live in the mint itself
+(metadata pointer + token metadata, the only extensions) and are locked: no update authority, no
+freeze authority, no transfer fees or hooks. Coins created before the switch are classic SPL tokens
+with Metaplex metadata and keep working. Openings are a single-price batch (the "line"), early flippers pay a decaying cover
 charge that goes to holders, and bonded coins move to a Raydium pool with 100% of the LP locked
 in Raydium's locker. While bonding, no wallet can get more than 3% of the supply: curve buys, line commits and the
 creator's opening buy are all checked. A

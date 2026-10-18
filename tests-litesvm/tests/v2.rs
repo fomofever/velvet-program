@@ -19,6 +19,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use spl_associated_token_account::get_associated_token_address as ata;
+use spl_associated_token_account::get_associated_token_address_with_program_id as ata_with;
 use std::str::FromStr;
 
 const SOL: u64 = 1_000_000_000;
@@ -38,6 +39,8 @@ fn amm_config() -> Pubkey { Pubkey::from_str("5MxLgy9oPdTC3YgkiePHqr3EoCRD9uLVYR
 fn lockp() -> Pubkey { Pubkey::from_str("DRay25Usp3YJAi7beckgpGUC7mGJ2cR1AVPxhYfwVCUX").unwrap() }
 fn pool_fee_rx() -> Pubkey { Pubkey::from_str("3oE58BKVt8KuYkGxx8zBojugnymWmBiyafWgMrnb6eYy").unwrap() }
 fn wsol() -> Pubkey { spl_token::native_mint::ID }
+/// Token-2022, the token program of every coin created since the switch.
+fn t22() -> Pubkey { Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap() }
 
 struct Env {
     svm: LiteSVM,
@@ -47,6 +50,9 @@ struct Env {
     config: Pubkey,
     /// Account passed as the storage wallet on launches (the treasury unless a test sets one).
     storage: Pubkey,
+    /// Create classic SPL coins (through the launchpad as deployed before Token-2022), as the
+    /// coins from before the switch are.
+    classic: bool,
 }
 
 fn load_fixture(svm: &mut LiteSVM, file: &str) {
@@ -97,9 +103,12 @@ fn programdata() -> Pubkey { Pubkey::find_program_address(&[pid().as_ref()], &so
 
 /// Deploy the program the way a real cluster does (upgradeable loader), with
 /// `authority` as its upgrade authority.
-fn deploy_upgradeable(svm: &mut LiteSVM, authority: &Pubkey) {
+fn deploy_upgradeable(svm: &mut LiteSVM, authority: &Pubkey) { deploy_binary(svm, authority, "../target/deploy/fairlaunch.so") }
+/// The launchpad as deployed before Token-2022 coins (dumped from devnet; see fetch-fixtures.sh).
+const V1_ELF: &str = "fixtures/fairlaunch_v1.so";
+fn deploy_binary(svm: &mut LiteSVM, authority: &Pubkey, path: &str) {
     use solana_sdk::bpf_loader_upgradeable::UpgradeableLoaderState;
-    let elf = std::fs::read("../target/deploy/fairlaunch.so").unwrap();
+    let elf = std::fs::read(path).unwrap();
     let mut pd = bincode::serialize(&UpgradeableLoaderState::ProgramData { slot: 0, upgrade_authority_address: Some(*authority) }).unwrap();
     pd.resize(UpgradeableLoaderState::size_of_programdata_metadata(), 0);
     pd.extend_from_slice(&elf);
@@ -149,7 +158,7 @@ fn setup_full(tweak: impl Fn(&mut ConfigParams), ext: ExtParams) -> Env {
     let treasury = Keypair::new().pubkey();
     svm.airdrop(&treasury, SOL).unwrap();
     let (config, _) = Pubkey::find_program_address(&[CONFIG_SEED], &pid());
-    let mut env = Env { svm, admin, distributor, treasury, config, storage: treasury };
+    let mut env = Env { svm, admin, distributor, treasury, config, storage: treasury, classic: false };
     let mut p = params(treasury, env.distributor.pubkey());
     tweak(&mut p);
     let ix = init_config_ix(config, &env.admin.pubkey(), p);
@@ -191,7 +200,12 @@ fn send_multi(svm: &mut LiteSVM, mut ixs: Vec<Instruction>, payer: &Keypair, ext
     let tx = Transaction::new_signed_with_payer(&ixs, Some(&payer.pubkey()), &signers, svm.latest_blockhash());
     let size = bincode::serialize(&tx).unwrap().len();
     assert!(size <= 1232, "transaction is {size} bytes, over Solana's 1232-byte limit");
-    svm.send_transaction(tx).map(|m| m.logs).map_err(|e| format!("{:?}\n{}", e.err, e.meta.logs.join("\n")))
+    let r = svm.send_transaction(tx).map(|m| m.logs).map_err(|e| format!("{:?}\n{}", e.err, e.meta.logs.join("\n")));
+    // VELVET_CU=1: print each top-level program's compute use (to size the site's compute limits).
+    if std::env::var("VELVET_CU").is_ok() {
+        if let Ok(logs) = &r { for l in logs.iter().filter(|l| l.contains(" consumed ") && (l.contains(&pid().to_string()) || l.contains(&fairlaunch::vpools::ID.to_string()))) { eprintln!("CU {size}B {l}"); } }
+    }
+    r
 }
 
 fn user(svm: &mut LiteSVM, sol: u64) -> Keypair {
@@ -203,7 +217,7 @@ fn launch_state(svm: &LiteSVM, launch: &Pubkey) -> Launch {
     Launch::try_deserialize(&mut svm.get_account(launch).unwrap().data.as_slice()).unwrap()
 }
 fn tok(svm: &LiteSVM, a: &Pubkey) -> u64 {
-    svm.get_account(a).map(|x| spl_token::state::Account::unpack(&x.data).unwrap().amount).unwrap_or(0)
+    svm.get_account(a).filter(|x| !x.data.is_empty()).map(|x| spl_token::state::Account::unpack_from_slice(&x.data).unwrap().amount).unwrap_or(0)
 }
 fn bal(svm: &LiteSVM, a: &Pubkey) -> u64 { svm.get_balance(a).unwrap_or(0) }
 fn slot(svm: &LiteSVM) -> u64 { svm.get_sysvar::<Clock>().slot }
@@ -219,28 +233,58 @@ fn advance(svm: &mut LiteSVM, slots: u64, secs: i64) {
 }
 
 #[derive(Clone, Copy)]
-struct L { mint: Pubkey, launch: Pubkey, vault: Pubkey, escrow: Pubkey }
+struct L { mint: Pubkey, launch: Pubkey, vault: Pubkey, escrow: Pubkey, tp: Pubkey }
+impl L {
+    /// `owner`'s token account for this coin.
+    fn ata(&self, owner: &Pubkey) -> Pubkey { ata_with(owner, &self.mint, &self.tp) }
+}
 
 fn create(env: &mut Env, creator: &Keypair, seed: [u8; 16], buy: u64, min_raise: u64, vest: i64) -> Result<L, String> {
+    if env.classic { return create_classic(env, creator, seed, buy, min_raise, vest); }
+    let (mint, _) = Pubkey::find_program_address(&[MINT_SEED, &seed], &pid());
+    let (launch, _) = Pubkey::find_program_address(&[LAUNCH_SEED, mint.as_ref()], &pid());
+    let (escrow, _) = Pubkey::find_program_address(&[ESCROW_SEED, launch.as_ref()], &pid());
+    let vault = ata_with(&launch, &mint, &t22());
+    let ix = Instruction {
+        program_id: pid(),
+        accounts: fairlaunch::accounts::CreateLaunch {
+            creator: creator.pubkey(), config: env.config, treasury: env.treasury, mint, launch, vault, escrow,
+            token_program: t22(), associated_token_program: spl_associated_token_account::ID,
+            system_program: system_program::ID, storage: env.storage, config_ext: ext_pda(),
+        }.to_account_metas(None),
+        data: create_data(seed, buy, min_raise, vest),
+    };
+    send(&mut env.svm, vec![ix], creator)?;
+    Ok(L { mint, launch, vault, escrow, tp: t22() })
+}
+fn create_data(seed: [u8; 16], buy: u64, min_raise: u64, vest: i64) -> Vec<u8> {
+    fairlaunch::instruction::CreateLaunch {
+        seed, name: "Velvet Test".into(), symbol: "VTEST".into(), uri: "https://velvet.example/m/x.json".into(),
+        auction_slots: AUCTION, creator_buy_lamports: buy, min_raise, vest_secs: vest,
+    }.data()
+}
+/// A classic SPL coin with Metaplex metadata, made by the launchpad as it was before Token-2022
+/// (the old binary is swapped in for the one transaction, then the current one put back).
+fn create_classic(env: &mut Env, creator: &Keypair, seed: [u8; 16], buy: u64, min_raise: u64, vest: i64) -> Result<L, String> {
     let (mint, _) = Pubkey::find_program_address(&[MINT_SEED, &seed], &pid());
     let (launch, _) = Pubkey::find_program_address(&[LAUNCH_SEED, mint.as_ref()], &pid());
     let (escrow, _) = Pubkey::find_program_address(&[ESCROW_SEED, launch.as_ref()], &pid());
     let (metadata, _) = Pubkey::find_program_address(&[b"metadata", mpl().as_ref(), mint.as_ref()], &mpl());
     let vault = ata(&launch, &mint);
-    let ix = Instruction {
-        program_id: pid(),
-        accounts: fairlaunch::accounts::CreateLaunch {
-            creator: creator.pubkey(), config: env.config, treasury: env.treasury, mint, launch, vault, escrow, metadata,
-            metadata_program: mpl(), token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID,
-            system_program: system_program::ID, rent: sysvar::rent::ID, storage: env.storage, config_ext: ext_pda(),
-        }.to_account_metas(None),
-        data: fairlaunch::instruction::CreateLaunch {
-            seed, name: "Velvet Test".into(), symbol: "VTEST".into(), uri: "https://velvet.example/m/x.json".into(),
-            auction_slots: AUCTION, creator_buy_lamports: buy, min_raise, vest_secs: vest,
-        }.data(),
-    };
-    send(&mut env.svm, vec![ix], creator)?;
-    Ok(L { mint, launch, vault, escrow })
+    let accounts = vec![
+        AccountMeta::new(creator.pubkey(), true), AccountMeta::new_readonly(env.config, false), AccountMeta::new(env.treasury, false),
+        AccountMeta::new(mint, false), AccountMeta::new(launch, false), AccountMeta::new(vault, false), AccountMeta::new(escrow, false),
+        AccountMeta::new(metadata, false), AccountMeta::new_readonly(mpl(), false), AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(spl_associated_token_account::ID, false), AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(sysvar::rent::ID, false), AccountMeta::new(env.storage, false), AccountMeta::new_readonly(ext_pda(), false),
+    ];
+    let ix = Instruction { program_id: pid(), accounts, data: create_data(seed, buy, min_raise, vest) };
+    let admin = env.admin.pubkey();
+    deploy_binary(&mut env.svm, &admin, V1_ELF);
+    let r = send(&mut env.svm, vec![ix], creator);
+    deploy_upgradeable(&mut env.svm, &admin);
+    r?;
+    Ok(L { mint, launch, vault, escrow, tp: spl_token::ID })
 }
 
 fn commit(env: &mut Env, l: &L, u: &Keypair, lamports: u64) -> Result<(), String> {
@@ -265,8 +309,8 @@ fn claim(env: &mut Env, l: &L, u: &Keypair) -> Result<(), String> {
     let ix = Instruction {
         program_id: pid(),
         accounts: fairlaunch::accounts::Claim {
-            user: u.pubkey(), launch: l.launch, mint: l.mint, commitment, vault: l.vault, user_ata: ata(&u.pubkey(), &l.mint),
-            token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID,
+            user: u.pubkey(), launch: l.launch, mint: l.mint, commitment, vault: l.vault, user_ata: l.ata(&u.pubkey()),
+            token_program: l.tp, associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID,
             pass: pass_pda(&u.pubkey()), config_ext: ext_pda(),
         }.to_account_metas(None),
         data: fairlaunch::instruction::Claim {}.data(),
@@ -277,8 +321,8 @@ fn escrow_ix(l: &L, creator: &Keypair, data: Vec<u8>) -> Instruction {
     Instruction {
         program_id: pid(),
         accounts: fairlaunch::accounts::CreatorEscrow {
-            creator: creator.pubkey(), launch: l.launch, mint: l.mint, escrow: l.escrow, vault: l.vault, creator_ata: ata(&creator.pubkey(), &l.mint),
-            token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID,
+            creator: creator.pubkey(), launch: l.launch, mint: l.mint, escrow: l.escrow, vault: l.vault, creator_ata: l.ata(&creator.pubkey()),
+            token_program: l.tp, associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID,
         }.to_account_metas(None),
         data,
     }
@@ -293,7 +337,7 @@ fn trade(env: &mut Env, l: &L, u: &Keypair, buy: bool, amount: u64) -> Result<()
         program_id: pid(),
         accounts: fairlaunch::accounts::TradeCtx {
             user: u.pubkey(), config: env.config, treasury: env.treasury, launch: l.launch, mint: l.mint, vault: l.vault,
-            user_ata: ata(&u.pubkey(), &l.mint), token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID,
+            user_ata: l.ata(&u.pubkey()), token_program: l.tp, associated_token_program: spl_associated_token_account::ID,
             system_program: system_program::ID,
             commitment: Pubkey::find_program_address(&[COMMIT_SEED, l.launch.as_ref(), u.pubkey().as_ref()], &pid()).0,
             pass: pass_pda(&u.pubkey()),
@@ -312,7 +356,7 @@ fn distribute_epoch(env: &mut Env, l: &L, signer: &Keypair, epoch: u32, pays: &[
         distributor: signer.pubkey(), config: env.config, launch: l.launch, mint: l.mint, vault: l.vault, escrow: l.escrow, pool_token_vault,
     }.to_account_metas(None);
     for (w, _) in pays {
-        metas.push(AccountMeta::new_readonly(ata(w, &l.mint), false));
+        metas.push(AccountMeta::new_readonly(l.ata(w), false));
         metas.push(AccountMeta::new(*w, false));
     }
     let ix = Instruction { program_id: pid(), accounts: metas, data: fairlaunch::instruction::DistributeRewards { epoch, amounts: pays.iter().map(|p| p.1).collect() }.data() };
@@ -351,16 +395,28 @@ fn create_writes_metadata_and_escrows_creator_bag() {
     let mut env = setup();
     let creator = user(&mut env.svm, 10);
     let l = create(&mut env, &creator, seed(1), SOL, 0, 86_400).unwrap();
-    let mint = spl_token::state::Mint::unpack(&env.svm.get_account(&l.mint).unwrap().data).unwrap();
+    let acc = env.svm.get_account(&l.mint).unwrap();
+    assert_eq!(acc.owner, t22(), "new coins are Token-2022");
+    assert!(acc.lamports >= env.svm.minimum_balance_for_rent_exemption(acc.data.len()), "rent-exempt after the metadata grew it");
+    let mint = spl_token::state::Mint::unpack_from_slice(&acc.data).unwrap();
     assert!(mint.mint_authority.is_none() && mint.freeze_authority.is_none());
     assert_eq!(mint.supply, TOTAL_SUPPLY);
+    // Extensions: exactly the metadata pointer (to the mint itself, no authority) and the
+    // metadata, whose update authority is gone.
+    let ext = mint_extensions(&acc.data);
+    assert_eq!(ext.iter().map(|e| e.0).collect::<Vec<_>>(), vec![18, 19], "MetadataPointer + TokenMetadata only");
+    assert_eq!(&ext[0].1[..32], &[0u8; 32], "no pointer authority");
+    assert_eq!(&ext[0].1[32..64], l.mint.as_ref());
+    let md = &ext[1].1;
+    assert_eq!(&md[..32], &[0u8; 32], "metadata is immutable");
+    assert_eq!(&md[32..64], l.mint.as_ref());
+    let text = String::from_utf8_lossy(md);
+    assert!(text.contains("Velvet Test") && text.contains("VTEST") && text.contains("https://velvet.example/m/x.json"));
     let (metadata, _) = Pubkey::find_program_address(&[b"metadata", mpl().as_ref(), l.mint.as_ref()], &mpl());
-    let md = env.svm.get_account(&metadata).expect("metadata account exists");
-    assert_eq!(md.owner, mpl());
-    assert!(String::from_utf8_lossy(&md.data).contains("VTEST"));
+    assert!(env.svm.get_account(&metadata).map(|a| a.data.is_empty()).unwrap_or(true), "no Metaplex account any more");
     let s = launch_state(&env.svm, &l.launch);
     assert_eq!(tok(&env.svm, &l.escrow), s.creator_tokens);
-    assert_eq!(tok(&env.svm, &ata(&creator.pubkey(), &l.mint)), 0, "creator holds nothing until vested");
+    assert_eq!(tok(&env.svm, &l.ata(&creator.pubkey())), 0, "creator holds nothing until vested");
     // creator buy fee: 1% of 1 SOL, a quarter to holders
     assert_eq!(s.reward_sol, SOL / 100 / 4);
 }
@@ -404,7 +460,7 @@ fn fair_line_fee_split_and_flipper_funds_holders() {
     settle(&mut env, &l, &early).unwrap();
     claim(&mut env, &l, &early).unwrap();
     claim(&mut env, &l, &late).unwrap();
-    assert_eq!(tok(&env.svm, &ata(&early.pubkey(), &l.mint)), tok(&env.svm, &ata(&late.pubkey(), &l.mint)));
+    assert_eq!(tok(&env.svm, &l.ata(&early.pubkey())), tok(&env.svm, &l.ata(&late.pubkey())));
     let s = launch_state(&env.svm, &l.launch);
     // settle fee 1% of 3 SOL: a quarter to holders, the rest to the treasury
     assert_eq!(s.reward_sol, 3 * SOL / 100 / 4);
@@ -437,11 +493,11 @@ fn creator_bag_vests_linearly() {
     settle(&mut env, &l, &creator).unwrap();
     advance(&mut env.svm, 10, 250);
     send(&mut env.svm, vec![escrow_ix(&l, &creator, fairlaunch::instruction::ClaimVested {}.data())], &creator).unwrap();
-    let got = tok(&env.svm, &ata(&creator.pubkey(), &l.mint));
+    let got = tok(&env.svm, &l.ata(&creator.pubkey()));
     assert!(got >= total / 4 && got <= total / 4 + total / 100, "about a quarter after 25%: {got} of {total}");
     advance(&mut env.svm, 10, 2_000);
     send(&mut env.svm, vec![escrow_ix(&l, &creator, fairlaunch::instruction::ClaimVested {}.data())], &creator).unwrap();
-    assert_eq!(tok(&env.svm, &ata(&creator.pubkey(), &l.mint)), total);
+    assert_eq!(tok(&env.svm, &l.ata(&creator.pubkey())), total);
     let e = send(&mut env.svm, vec![escrow_ix(&l, &creator, fairlaunch::instruction::ClaimVested {}.data())], &creator).unwrap_err();
     assert!(e.contains("NothingToClaim"), "{e}");
 }
@@ -496,6 +552,11 @@ fn pool_keys_at(l: &L, pool: Pubkey) -> PoolKeys {
     }
 }
 fn pool_keys(env: &Env, l: &L) -> PoolKeys { pool_keys_at(l, launch_state(&env.svm, &l.launch).pool) }
+/// Bond a full curve the way its coin type does: Token-2022 coins into Velvet Pools (whatever the
+/// setting), classic coins into Raydium (unless Velvet Pools is on).
+fn bond(env: &mut Env, l: &L, payer: &Keypair) -> Result<Vec<String>, String> {
+    if l.tp == t22() { graduate_velvet(env, l, payer) } else { graduate(env, l, payer) }
+}
 fn graduate(env: &mut Env, l: &L, payer: &Keypair) -> Result<Vec<String>, String> {
     let pool_kp = Keypair::new();
     graduate_with(env, l, payer, &pool_kp)
@@ -511,7 +572,7 @@ fn graduate_with(env: &mut Env, l: &L, payer: &Keypair, pool_kp: &Keypair) -> Re
         program_id: pid(),
         accounts: fairlaunch::accounts::Graduate {
             payer: payer.pubkey(), config: env.config, treasury: env.treasury, launch: l.launch, mint: l.mint, vault: l.vault,
-            grad_auth: k.grad, grad_wsol: ata(&k.grad, &wsol()), grad_token: ata(&k.grad, &l.mint), grad_lp: ata(&k.grad, &k.lp_mint),
+            grad_auth: k.grad, grad_wsol: ata(&k.grad, &wsol()), grad_token: l.ata(&k.grad), grad_lp: ata(&k.grad, &k.lp_mint),
             wsol_mint: wsol(), cpmm_program: cpmm(), amm_config: amm_config(), ray_authority: raydium::authority(&cpmm()),
             pool_state: k.pool, lp_mint: k.lp_mint, token_0_vault: k.v0, token_1_vault: k.v1, create_pool_fee: pool_fee_rx(),
             observation: k.obs, token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID,
@@ -525,7 +586,7 @@ fn graduate_with(env: &mut Env, l: &L, payer: &Keypair, pool_kp: &Keypair) -> Re
 fn swap_sol_for_token(env: &mut Env, l: &L, u: &Keypair, lamports: u64) {
     let k = pool_keys(env, l);
     let user_wsol = ata(&u.pubkey(), &wsol());
-    let user_tok = ata(&u.pubkey(), &l.mint);
+    let user_tok = l.ata(&u.pubkey());
     let mut ixs = vec![
         spl_associated_token_account::instruction::create_associated_token_account_idempotent(&u.pubkey(), &u.pubkey(), &wsol(), &spl_token::ID),
         spl_associated_token_account::instruction::create_associated_token_account_idempotent(&u.pubkey(), &u.pubkey(), &l.mint, &spl_token::ID),
@@ -587,7 +648,7 @@ fn collect_fees(env: &mut Env, l: &L, creator: &Pubkey, payer: &Keypair) -> Resu
         program_id: pid(),
         accounts: fairlaunch::accounts::CollectPoolFees {
             payer: payer.pubkey(), config: env.config, treasury: env.treasury, launch: l.launch, creator: *creator, mint: l.mint,
-            grad_auth: k.grad, grad_wsol: ata(&k.grad, &wsol()), grad_token: ata(&k.grad, &l.mint), wsol_mint: wsol(),
+            grad_auth: k.grad, grad_wsol: ata(&k.grad, &wsol()), grad_token: l.ata(&k.grad), wsol_mint: wsol(),
             cpmm_program: cpmm(), ray_authority: raydium::authority(&cpmm()), pool_state: k.pool, lp_mint: k.lp_mint,
             token_0_vault: k.v0, token_1_vault: k.v1, lock_program: lockp(), lock_authority: lock_auth,
             locked_liquidity: raydium::lock::locked_liquidity(&lockp(), &s.fee_nft_mint), fee_nft_account: ata(&k.grad, &s.fee_nft_mint),
@@ -603,6 +664,7 @@ fn collect_fees(env: &mut Env, l: &L, creator: &Pubkey, payer: &Keypair) -> Resu
 #[test]
 fn graduates_into_raydium_burns_lp_and_collects_creator_fees() {
     let mut env = setup();
+    env.classic = true; // Raydium graduation is for classic coins
     let creator = user(&mut env.svm, 10);
     let l = create(&mut env, &creator, seed(6), SOL, 0, 0).unwrap();
     let e = graduate(&mut env, &l, &creator).unwrap_err();
@@ -640,7 +702,7 @@ fn graduates_into_raydium_burns_lp_and_collects_creator_fees() {
     assert!(bal(&env.svm, &env.treasury) - t0 >= SOL, "graduation fee (plus unused overhead) to treasury");
     // late claimers still get their tokens from the vault after graduation
     for w in &whales[5..] { claim(&mut env, &l, w).unwrap(); }
-    let held: u64 = whales.iter().map(|w| tok(&env.svm, &ata(&w.pubkey(), &l.mint))).sum();
+    let held: u64 = whales.iter().map(|w| tok(&env.svm, &l.ata(&w.pubkey()))).sum();
     assert!(held <= s.batch_tokens && s.batch_tokens - held < 100);
     // curve trading is closed
     let e = trade(&mut env, &l, &whales[0], true, SOL).unwrap_err();
@@ -650,7 +712,7 @@ fn graduates_into_raydium_burns_lp_and_collects_creator_fees() {
     advance(&mut env.svm, 5, 10);
     let trader = user(&mut env.svm, 50);
     swap_sol_for_token(&mut env, &l, &trader, 20 * SOL);
-    assert!(tok(&env.svm, &ata(&trader.pubkey(), &l.mint)) > 0);
+    assert!(tok(&env.svm, &l.ata(&trader.pubkey())) > 0);
     let (c0, r0, t1) = (bal(&env.svm, &creator.pubkey()), launch_state(&env.svm, &l.launch).reward_sol, bal(&env.svm, &env.treasury));
     let logs = collect_fees(&mut env, &l, &creator.pubkey(), &whales[2]).unwrap();
     println!("collect CU: {:?}", logs.iter().find(|x| x.contains(&format!("{} consumed", pid()))));
@@ -708,7 +770,7 @@ fn free_keys(seed: &[u8; 16]) -> L {
     let (mint, _) = Pubkey::find_program_address(&[MINT_SEED, seed], &pid());
     let (launch, _) = Pubkey::find_program_address(&[LAUNCH_SEED, mint.as_ref()], &pid());
     let (escrow, _) = Pubkey::find_program_address(&[ESCROW_SEED, launch.as_ref()], &pid());
-    L { mint, launch, vault: ata(&launch, &mint), escrow }
+    L { mint, launch, vault: ata_with(&launch, &mint, &t22()), escrow, tp: t22() }
 }
 
 /// [Ed25519 approval by `signer` over `msg`, create_launch_signed for `creator` paid by `payer`].
@@ -718,13 +780,12 @@ fn free_ixs(env: &Env, f: &Free, signer: &Keypair, creator: Pubkey, payer: &Pubk
     let sig: [u8; 64] = signer.sign_message(&msg).as_ref().try_into().unwrap();
     let ed = solana_sdk::ed25519_instruction::new_ed25519_instruction_with_signature(&msg, &sig, &signer.pubkey().to_bytes());
     let l = free_keys(&f.seed);
-    let (metadata, _) = Pubkey::find_program_address(&[b"metadata", mpl().as_ref(), l.mint.as_ref()], &mpl());
     let ix = Instruction {
         program_id: pid(),
         accounts: fairlaunch::accounts::CreateLaunchSigned {
-            payer: *payer, config: env.config, mint: l.mint, launch: l.launch, vault: l.vault, escrow: l.escrow, metadata,
-            instructions: sysvar::instructions::ID, metadata_program: mpl(), token_program: spl_token::ID,
-            associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID, rent: sysvar::rent::ID,
+            payer: *payer, config: env.config, mint: l.mint, launch: l.launch, vault: l.vault, escrow: l.escrow,
+            instructions: sysvar::instructions::ID, token_program: t22(),
+            associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID,
             storage: env.storage, config_ext: ext_pda(),
         }.to_account_metas(None),
         data: fairlaunch::instruction::CreateLaunchSigned {
@@ -765,13 +826,13 @@ fn free_launch_creator_pays_nothing_and_first_buyer_deploys() {
     assert_eq!(tok(&env.svm, &l.vault), TOTAL_SUPPLY);
     let sp: LaunchSponsored = event(&logs).unwrap();
     assert_eq!((sp.creator, sp.payer), (creator.pubkey(), buyer.pubkey()));
-    let md = Pubkey::find_program_address(&[b"metadata", mpl().as_ref(), l.mint.as_ref()], &mpl()).0;
-    assert_eq!(env.svm.get_account(&md).unwrap().owner, mpl(), "metadata written");
+    let ext = mint_extensions(&env.svm.get_account(&l.mint).unwrap().data);
+    assert!(String::from_utf8_lossy(&ext[1].1).contains(FREE_SYM), "metadata written");
     // it's a normal coin from here on
     advance(&mut env.svm, AUCTION, 20);
     settle(&mut env, &l, &buyer).unwrap();
     claim(&mut env, &l, &buyer).unwrap();
-    assert!(tok(&env.svm, &ata(&buyer.pubkey(), &l.mint)) > 0);
+    assert!(tok(&env.svm, &l.ata(&buyer.pubkey())) > 0);
     // the same approval can't deploy a second coin
     let again = free_ixs(&env, &f, &creator, creator.pubkey(), &buyer.pubkey(), None);
     assert!(send(&mut env.svm, again, &buyer).is_err());
@@ -832,7 +893,7 @@ fn no_wallet_can_buy_past_three_percent_while_bonding() {
     trade(&mut env, &l, &whale, true, SOL / 2).unwrap();
     let mut n = 0;
     while trade(&mut env, &l, &whale, true, SOL / 2).is_ok() { n += 1; assert!(n < 100); }
-    let held = tok(&env.svm, &ata(&whale.pubkey(), &l.mint));
+    let held = tok(&env.svm, &l.ata(&whale.pubkey()));
     assert!(held <= MAX_WALLET_TOKENS_BONDING && held > MAX_WALLET_TOKENS_BONDING * 8 / 10, "held {held}");
     // selling is never limited
     trade(&mut env, &l, &whale, false, held / 2).unwrap();
@@ -875,8 +936,8 @@ fn the_line_and_the_opening_buy_are_held_to_three_percent() {
     settle(&mut env, &l, &a).unwrap();
     claim(&mut env, &l, &a).unwrap();
     claim(&mut env, &l, &creator).unwrap();
-    assert!(tok(&env.svm, &ata(&a.pubkey(), &l.mint)) <= MAX_WALLET_TOKENS_BONDING);
-    assert!(tok(&env.svm, &ata(&creator.pubkey(), &l.mint)) + own <= MAX_WALLET_TOKENS_BONDING);
+    assert!(tok(&env.svm, &l.ata(&a.pubkey())) <= MAX_WALLET_TOKENS_BONDING);
+    assert!(tok(&env.svm, &l.ata(&creator.pubkey())) + own <= MAX_WALLET_TOKENS_BONDING);
 }
 
 /// Buying on the curve before claiming doesn't get around the cap: an unclaimed line share and
@@ -918,6 +979,7 @@ fn seventy_thirty_curve_bonds_at_the_curve_price() {
     // Small raise so the test can fill it: bonds at ~20 SOL (V0 = R (VT - C) / C).
     const RAISE: u64 = 20 * SOL;
     let mut env = setup_with(|p| { p.curve_tokens = CT; p.virtual_tokens = VT; p.virtual_sol = (RAISE as u128 * (VT - CT) as u128 / CT as u128) as u64; });
+    env.classic = true; // checks the Raydium pool
     let creator = user(&mut env.svm, 5);
     let l = create(&mut env, &creator, seed(49), 0, 0, 0).unwrap();
     let s = launch_state(&env.svm, &l.launch);
@@ -1052,9 +1114,9 @@ fn stolen_distributor_key_cannot_drain_the_holder_pool() {
     assert!(e.contains("RewardAboveShare"), "{e}");
     // the thief's fair-ish cap is tiny
     let s = launch_state(&env.svm, &l.launch);
-    let mint = spl_token::state::Mint::unpack(&env.svm.get_account(&l.mint).unwrap().data).unwrap();
+    let mint = spl_token::state::Mint::unpack_from_slice(&env.svm.get_account(&l.mint).unwrap().data).unwrap();
     let circ = mint.supply - tok(&env.svm, &l.vault) - tok(&env.svm, &l.escrow);
-    let cap = (4u128 * tok(&env.svm, &ata(&thief.pubkey(), &l.mint)) as u128 * s.reward_sol as u128 / circ as u128) as u64;
+    let cap = (4u128 * tok(&env.svm, &l.ata(&thief.pubkey())) as u128 * s.reward_sol as u128 / circ as u128) as u64;
     assert!(cap < pool / 50, "thief cap {cap} vs pool {pool}");
     distribute_epoch(&mut env, &l, &dist, 1, &[(thief.pubkey(), cap)]).unwrap();
     // replaying the same epoch can't exceed the epoch budget, and a new epoch has to wait
@@ -1079,6 +1141,7 @@ fn stolen_distributor_key_cannot_drain_the_holder_pool() {
 #[test]
 fn someone_creating_the_raydium_pool_first_cannot_block_graduation() {
     let mut env = setup();
+    env.classic = true; // Raydium graduation is for classic coins
     let creator = user(&mut env.svm, 10);
     let l = create(&mut env, &creator, seed(22), SOL, 0, 0).unwrap();
     let attacker = user(&mut env.svm, 20);
@@ -1096,7 +1159,7 @@ fn someone_creating_the_raydium_pool_first_cannot_block_graduation() {
     let pda_pool = raydium::pool_state(&cpmm(), &amm_config(), &m0, &m1);
     let a = attacker.pubkey();
     let a_wsol = ata(&a, &wsol());
-    let a_tok = ata(&a, &l.mint);
+    let a_tok = l.ata(&a);
     let lp = raydium::lp_mint(&cpmm(), &pda_pool);
     let keys = raydium::InitializeKeys {
         program: cpmm(), creator: a, amm_config: amm_config(), authority: raydium::authority(&cpmm()), pool_state: pda_pool,
@@ -1156,9 +1219,15 @@ fn check_books(env: &Env, f: &mut FL, ctx: &str) {
     if !s.cancelled || s.creator_tokens > 0 {
         assert_eq!(tok(&env.svm, &f.l.escrow), s.creator_tokens - s.creator_claimed, "[{ctx}] escrow mismatch");
     }
-    let mint = spl_token::state::Mint::unpack(&env.svm.get_account(&f.l.mint).unwrap().data).unwrap();
+    let mint = spl_token::state::Mint::unpack_from_slice(&env.svm.get_account(&f.l.mint).unwrap().data).unwrap();
     assert!(mint.mint_authority.is_none() && mint.freeze_authority.is_none(), "[{ctx}] authority reappeared");
-    assert_eq!(mint.supply, TOTAL_SUPPLY, "[{ctx}] supply changed");
+    // Bonding into Velvet Pools burns the part of the LP reserve above the curve's last price.
+    let s_now = launch_state(&env.svm, &f.l.launch);
+    if s_now.graduated && s_now.pool_kind == 1 {
+        assert!(mint.supply < TOTAL_SUPPLY && mint.supply > TOTAL_SUPPLY - s_now.lp_reserve, "[{ctx}] burn out of range");
+    } else {
+        assert_eq!(mint.supply, TOTAL_SUPPLY, "[{ctx}] supply changed");
+    }
     let total_rewards = s.reward_sol + s.reward_paid;
     assert!(total_rewards >= f.last_rewards, "[{ctx}] holder rewards went backwards");
     f.last_rewards = total_rewards;
@@ -1168,6 +1237,8 @@ fn check_books(env: &Env, f: &mut FL, ctx: &str) {
 
 fn run_fuzz(seed: u64, steps: usize) -> (usize, usize, usize) {
     let mut env = setup();
+    // Odd seeds run classic coins through Raydium, even ones Token-2022 coins through Velvet Pools.
+    env.classic = seed % 2 == 1;
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1));
     let users: Vec<Keypair> = (0..24).map(|_| user(&mut env.svm, 60)).collect();
     let mut fl: Vec<FL> = vec![];
@@ -1228,13 +1299,13 @@ fn run_fuzz(seed: u64, steps: usize) -> (usize, usize, usize) {
                 6 => {
                     let has = fl[i].commits.contains_key(&u) && !fl[i].claimed.contains(&u);
                     let should = s.settled && has;
-                    let before_t = tok(&env.svm, &ata(&users[u].pubkey(), &l.mint));
+                    let before_t = tok(&env.svm, &l.ata(&users[u].pubkey()));
                     match claim(&mut env, &l, &users[u]) {
                         Ok(()) => {
                             assert!(should, "[{ctx}] claim accepted without a commitment / twice");
                             let s2 = launch_state(&env.svm, &l.launch);
                             let amt = fl[i].commits[&u] as u128;
-                            let got = tok(&env.svm, &ata(&users[u].pubkey(), &l.mint)) - before_t;
+                            let got = tok(&env.svm, &l.ata(&users[u].pubkey())) - before_t;
                             let want = if s2.cancelled { 0 } else { (s2.batch_tokens as u128 * amt / s2.total_committed as u128) as u64 };
                             assert_eq!(got, want, "[{ctx}] unfair claim: got {got}, pro-rata {want}");
                             fl[i].claimed.insert(u); ok += 1
@@ -1251,7 +1322,7 @@ fn run_fuzz(seed: u64, steps: usize) -> (usize, usize, usize) {
                     }
                 }
                 9 => {
-                    let bal_t = tok(&env.svm, &ata(&users[u].pubkey(), &l.mint));
+                    let bal_t = tok(&env.svm, &l.ata(&users[u].pubkey()));
                     let amt = if rng.chance(15) { bal_t + 1 } else { bal_t * (rng.below(100) + 1) / 100 };
                     let should = is_open(&s) && amt > 0 && amt <= bal_t;
                     match trade(&mut env, &l, &users[u], false, amt) {
@@ -1275,13 +1346,13 @@ fn run_fuzz(seed: u64, steps: usize) -> (usize, usize, usize) {
                     let epoch = s.reward_epochs + if rng.chance(50) { 1 } else { 0 };
                     let before: Vec<u64> = uniq.iter().map(|p| bal(&env.svm, &p.0)).collect();
                     if distribute_epoch(&mut env, &l, &dist, epoch, &uniq).is_ok() {
-                        let mint = spl_token::state::Mint::unpack(&env.svm.get_account(&l.mint).unwrap().data).unwrap();
+                        let mint = spl_token::state::Mint::unpack_from_slice(&env.svm.get_account(&l.mint).unwrap().data).unwrap();
                         let s2 = launch_state(&env.svm, &l.launch);
                         // same definition as the program: supply minus curve vault, escrow and (after graduation) the pool's token vault
                         let pool_tok = if s2.graduated { tok(&env.svm, &raydium::vault(&cpmm(), &s2.pool, &l.mint)) } else { 0 };
                         let circ = mint.supply - tok(&env.svm, &l.vault) - tok(&env.svm, &l.escrow) - pool_tok;
                         for ((w, amt), b) in uniq.iter().zip(before) {
-                            let held = tok(&env.svm, &ata(w, &l.mint));
+                            let held = tok(&env.svm, &l.ata(w));
                             assert!(held > 0, "[{ctx}] paid a non-holder");
                             assert!((*amt as u128) * (circ as u128) <= 4 * held as u128 * s2.epoch_budget as u128, "[{ctx}] paid above 4x share");
                             assert_eq!(bal(&env.svm, w) - b, *amt);
@@ -1292,11 +1363,13 @@ fn run_fuzz(seed: u64, steps: usize) -> (usize, usize, usize) {
                 }
                 _ => {
                     if s.complete && !s.graduated {
-                        graduate(&mut env, &l, &users[u]).unwrap_or_else(|e| panic!("[{ctx}] graduation failed: {e}"));
-                        lock_liquidity(&mut env, &l, &users[u]).unwrap_or_else(|e| panic!("[{ctx}] lock failed: {e}"));
+                        bond(&mut env, &l, &users[u]).unwrap_or_else(|e| panic!("[{ctx}] graduation failed: {e}"));
+                        if l.tp == spl_token::ID {
+                            lock_liquidity(&mut env, &l, &users[u]).unwrap_or_else(|e| panic!("[{ctx}] lock failed: {e}"));
+                        }
                         graduated += 1; ok += 1;
                     } else if !s.complete {
-                        assert!(graduate(&mut env, &l, &users[u]).is_err(), "[{ctx}] graduated an incomplete curve");
+                        assert!(bond(&mut env, &l, &users[u]).is_err(), "[{ctx}] graduated an incomplete curve");
                         rejected += 1;
                     }
                 }
@@ -1420,14 +1493,14 @@ fn a_full_line_cannot_complete_the_curve_during_the_cover_charge() {
     let late = user(&mut env.svm, 10);
     let e = trade(&mut env, &l, &late, true, SOL).unwrap_err();
     assert!(e.contains("CurveFillTooEarly"), "{e}");
-    assert!(graduate(&mut env, &l, &late).unwrap_err().contains("NotComplete"));
+    assert!(bond(&mut env, &l, &late).unwrap_err().contains("NotComplete"));
     // Trading carries on: a small buy that leaves the curve open is fine, and so are sells.
     claim(&mut env, &l, &whales[1]).unwrap();
-    let held = tok(&env.svm, &ata(&whales[1].pubkey(), &l.mint));
+    let held = tok(&env.svm, &l.ata(&whales[1].pubkey()));
     trade(&mut env, &l, &whales[1], false, held / 10).unwrap();
     // After the cover charge, the next buy completes the curve and bonding works.
     finish_curve(&mut env, &l);
-    graduate(&mut env, &l, &late).unwrap();
+    bond(&mut env, &l, &late).unwrap();
     assert!(launch_state(&env.svm, &l.launch).graduated);
 }
 
@@ -1445,7 +1518,7 @@ fn whole_line_refunds_add_up_when_the_line_stops_short() {
     for w in &whales {
         let b0 = bal(&env.svm, &w.pubkey());
         claim(&mut env, &l, w).unwrap();
-        got_tokens += tok(&env.svm, &ata(&w.pubkey(), &l.mint));
+        got_tokens += tok(&env.svm, &l.ata(&w.pubkey()));
         let back = bal(&env.svm, &w.pubkey()) + 2_100_000 - b0; // ATA rent the claim paid
         assert!(back > 0 && back <= per, "refund {back} <= committed {per}");
     }
@@ -1467,7 +1540,7 @@ fn a_big_line_unlocks_a_quarter_at_open_and_the_rest_over_an_hour() {
     assert_eq!((s.line_unlock_bps, s.line_vest_secs), (2_500, 3_600));
     let a = &ws[3];
     let share = share_of(&env, &l, per);
-    let a_ata = ata(&a.pubkey(), &l.mint);
+    let a_ata = l.ata(&a.pubkey());
     claim(&mut env, &l, a).unwrap();
     assert_eq!(tok(&env.svm, &a_ata), share / 4, "a quarter at open");
     assert!(claim(&mut env, &l, a).unwrap_err().contains("NothingToClaim"), "nothing more yet");
@@ -1484,7 +1557,7 @@ fn a_big_line_unlocks_a_quarter_at_open_and_the_rest_over_an_hour() {
     // Someone who waits the whole hour gets everything in one claim.
     let b = &ws[4];
     claim(&mut env, &l, b).unwrap();
-    assert_eq!(tok(&env.svm, &ata(&b.pubkey(), &l.mint)), share);
+    assert_eq!(tok(&env.svm, &l.ata(&b.pubkey())), share);
 }
 
 #[test]
@@ -1499,7 +1572,7 @@ fn a_small_line_opens_fully_unlocked() {
     let s = launch_state(&env.svm, &l.launch);
     assert_eq!(s.line_vest_secs, 0);
     claim(&mut env, &l, &ws[1]).unwrap();
-    assert_eq!(tok(&env.svm, &ata(&ws[1].pubkey(), &l.mint)), share_of(&env, &l, per));
+    assert_eq!(tok(&env.svm, &l.ata(&ws[1].pubkey())), share_of(&env, &l, per));
 }
 
 #[test]
@@ -1515,10 +1588,10 @@ fn locked_line_tokens_keep_unlocking_after_the_coin_bonds() {
     let share = share_of(&env, &l, per);
     claim(&mut env, &l, a).unwrap();
     finish_curve(&mut env, &l);
-    graduate(&mut env, &l, &ws[1]).unwrap();
+    bond(&mut env, &l, &ws[1]).unwrap();
     advance(&mut env.svm, 10, 4_000);
     claim(&mut env, &l, a).unwrap();
-    assert_eq!(tok(&env.svm, &ata(&a.pubkey(), &l.mint)), share, "the rest arrives after bonding too");
+    assert_eq!(tok(&env.svm, &l.ata(&a.pubkey())), share, "the rest arrives after bonding too");
 }
 
 #[test]
@@ -1539,20 +1612,20 @@ fn commitments_from_before_partial_claims_still_claim() {
     settle(&mut env, &l, &ws[0]).unwrap();
     let share = share_of(&env, &l, per);
     claim(&mut env, &l, &ws[1]).unwrap();
-    assert_eq!(tok(&env.svm, &ata(&ws[1].pubkey(), &l.mint)), share / 4);
+    assert_eq!(tok(&env.svm, &l.ata(&ws[1].pubkey())), share / 4);
     assert_eq!(env.svm.get_account(&commit_pda(&l, &ws[1].pubkey())).unwrap().data.len(), 8 + <Commitment as anchor_lang::Space>::INIT_SPACE, "grown to the new layout");
     advance(&mut env.svm, 10, 3_600);
     claim(&mut env, &l, &ws[1]).unwrap();
     claim(&mut env, &l, &ws[2]).unwrap();
-    assert_eq!(tok(&env.svm, &ata(&ws[1].pubkey(), &l.mint)), share);
-    assert_eq!(tok(&env.svm, &ata(&ws[2].pubkey(), &l.mint)), share);
+    assert_eq!(tok(&env.svm, &l.ata(&ws[1].pubkey())), share);
+    assert_eq!(tok(&env.svm, &l.ata(&ws[2].pubkey())), share);
 }
 
 #[test]
 fn extra_settings_change_only_through_the_timelock() {
     let mut env = setup();
     let admin = env.admin.insecure_clone();
-    let mut p = big_line_ext();
+    let p = big_line_ext();
     let prop = |p: ExtParams| Instruction {
         program_id: pid(),
         accounts: fairlaunch::accounts::AdminConfigExt { authority: admin.pubkey(), config: env.config, config_ext: ext_pda() }.to_account_metas(None),
@@ -1600,7 +1673,7 @@ fn velvet_pass_counts_real_lines_and_flips_cost_a_tier() {
     assert_eq!((p.lines, p.tier()), (10, 2), "VIP after 10 lines and 5 SOL");
     // A flip: selling while the cover charge is on drops a tier.
     let l = run_line(&mut env, 120, &w, SOL / 2);
-    let held = tok(&env.svm, &ata(&w.pubkey(), &l.mint));
+    let held = tok(&env.svm, &l.ata(&w.pubkey()));
     trade(&mut env, &l, &w, false, held / 2).unwrap();
     let p = pass_of(&env, &w.pubkey()).unwrap();
     assert_eq!((p.flips, p.tier()), (1, 1), "a flip costs a tier");
@@ -1636,8 +1709,8 @@ fn vips_pay_half_the_cover_charge() {
     let t1 = bal(&env.svm, &env.treasury);
     trade(&mut env, &l, &vip, true, SOL / 10).unwrap();
     let vip_fee_flow = bal(&env.svm, &env.treasury) - t1;
-    let g = tok(&env.svm, &ata(&guest.pubkey(), &l.mint));
-    let v = tok(&env.svm, &ata(&vip.pubkey(), &l.mint));
+    let g = tok(&env.svm, &l.ata(&guest.pubkey()));
+    let v = tok(&env.svm, &l.ata(&vip.pubkey()));
     println!("guest got {g}, VIP got {v} (fee flows {guest_fee_flow} / {vip_fee_flow})");
     // At ~50% cover the guest buys with ~0.5 of each SOL, the VIP with ~0.75 (and bought second,
     // at a slightly higher price).
@@ -1674,9 +1747,10 @@ fn graduate_velvet(env: &mut Env, l: &L, payer: &Keypair) -> Result<Vec<String>,
         program_id: pid(),
         accounts: fairlaunch::accounts::GraduateVelvet {
             payer: payer.pubkey(), config: env.config, config_ext: ext_pda(), treasury: env.treasury, launch: l.launch, mint: l.mint, vault: l.vault,
-            grad_auth: grad, grad_wsol: ata(&grad, &wsol()), grad_token: ata(&grad, &l.mint), wsol_mint: wsol(), pools_program: vpools::ID,
+            grad_auth: grad, grad_wsol: ata(&grad, &wsol()), grad_token: l.ata(&grad), wsol_mint: wsol(), pools_program: vpools::ID,
             pool, pool_vault_auth: vpools::vault_auth(), pool_sol_vault: vpools::vault(&pool, &wsol()), pool_token_vault: vpools::vault(&pool, &l.mint),
             token_program: spl_token::ID, associated_token_program: spl_associated_token_account::ID, system_program: system_program::ID,
+            coin_token_program: l.tp,
         }.to_account_metas(None),
         data: fairlaunch::instruction::GraduateVelvet {}.data(),
     };
@@ -1686,10 +1760,10 @@ fn graduate_velvet(env: &mut Env, l: &L, payer: &Keypair) -> Result<Vec<String>,
 fn vp_swap(env: &mut Env, l: &L, u: &Keypair, buy: bool, amount: u64, min_out: u64) -> Result<Vec<String>, String> {
     let pool = vpools::pool(&l.mint);
     let user_wsol = ata(&u.pubkey(), &wsol());
-    let user_tok = ata(&u.pubkey(), &l.mint);
+    let user_tok = l.ata(&u.pubkey());
     let mut ixs = vec![
         spl_associated_token_account::instruction::create_associated_token_account_idempotent(&u.pubkey(), &u.pubkey(), &wsol(), &spl_token::ID),
-        spl_associated_token_account::instruction::create_associated_token_account_idempotent(&u.pubkey(), &u.pubkey(), &l.mint, &spl_token::ID),
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(&u.pubkey(), &u.pubkey(), &l.mint, &l.tp),
     ];
     if buy {
         ixs.push(solana_sdk::system_instruction::transfer(&u.pubkey(), &user_wsol, amount));
@@ -1705,6 +1779,7 @@ fn vp_swap(env: &mut Env, l: &L, u: &Keypair, buy: bool, amount: u64, min_out: u
             AccountMeta::new_readonly(u.pubkey(), true), AccountMeta::new(pool, false), AccountMeta::new_readonly(vpools::vault_auth(), false),
             AccountMeta::new(vpools::vault(&pool, &wsol()), false), AccountMeta::new(vpools::vault(&pool, &l.mint), false),
             AccountMeta::new(user_wsol, false), AccountMeta::new(user_tok, false), AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(l.tp, false),
         ],
         data,
     });
@@ -1753,13 +1828,18 @@ fn coins_bond_into_velvet_pools_with_locked_liquidity() {
     let late = user(&mut env.svm, 5);
     let _ = ws;
     let l2c = user(&mut env.svm, 10);
+    env.classic = true;
     let l2 = create(&mut env, &l2c, seed(201), 0, 0, 0).unwrap();
+    env.classic = false;
     let w2 = fill_line(&mut env, &l2, 60);
     advance(&mut env.svm, AUCTION, 20);
     settle(&mut env, &l2, &w2[0]).unwrap();
     finish_curve(&mut env, &l2);
     let e = graduate(&mut env, &l2, &late).unwrap_err();
     assert!(e.contains("WrongPoolAccount"), "{e}");
+    // ...so a classic coin bonds into Velvet Pools too.
+    graduate_velvet(&mut env, &l2, &late).unwrap();
+    assert_eq!(launch_state(&env.svm, &l2.launch).pool_kind, 1);
 }
 
 #[test]
@@ -1772,7 +1852,7 @@ fn velvet_pool_swaps_charge_0_35_percent_in_sol_and_split_it_three_ways() {
     let tv0 = tok(&env.svm, &vpools::vault(&pool, &l.mint));
     // Buy 10 SOL.
     vp_swap(&mut env, &l, &trader, true, 10 * SOL, 1).unwrap();
-    let got = tok(&env.svm, &ata(&trader.pubkey(), &l.mint));
+    let got = tok(&env.svm, &l.ata(&trader.pubkey()));
     let fee = (10 * SOL as u128 * 3_500 + 999_999) / 1_000_000;
     let expect = ((10 * SOL as u128 - fee) * tv0 as u128 / (sv0 as u128 + 10 * SOL as u128 - fee)) as u64;
     assert_eq!(got, expect, "constant product after a 0.35% fee");
@@ -1787,7 +1867,7 @@ fn velvet_pool_swaps_charge_0_35_percent_in_sol_and_split_it_three_ways() {
     let back = bal(&env.svm, &trader.pubkey()) + 5_000 * 2 - b0; // tx fees aside
     assert!(back > 4 * SOL && back < 6 * SOL, "half the bag back: {back}");
     // Selling the rest: the whole round trip returns less than the 10 SOL put in.
-    let rest = tok(&env.svm, &ata(&trader.pubkey(), &l.mint));
+    let rest = tok(&env.svm, &l.ata(&trader.pubkey()));
     let b1 = bal(&env.svm, &trader.pubkey());
     vp_swap(&mut env, &l, &trader, false, rest, 1).unwrap();
     let total_back = back + bal(&env.svm, &trader.pubkey()) + 10_000 - b1;
@@ -1819,7 +1899,7 @@ fn nobody_else_can_create_a_velvet_pool_or_take_its_fees() {
     let creator2 = user(&mut env.svm, 10);
     let l2 = create(&mut env, &creator2, seed(205), 0, 0, 0).unwrap();
     let (_, bump) = Pubkey::find_program_address(&[GRAD_SEED, l2.launch.as_ref()], &pid());
-    let ix = vpools::initialize_ix(fake_creator.pubkey(), l2.mint, wsol(), ata(&fake_creator.pubkey(), &wsol()), ata(&fake_creator.pubkey(), &l2.mint), l2.launch, bump, SOL, 1);
+    let ix = vpools::initialize_ix(fake_creator.pubkey(), l2.mint, wsol(), ata(&fake_creator.pubkey(), &wsol()), l2.ata(&fake_creator.pubkey()), l2.launch, bump, SOL, 1, l2.tp);
     let e = send(&mut env.svm, vec![ix], &attacker).unwrap_err();
     assert!(e.contains("NotLaunchpad") || e.contains("ConstraintTokenOwner") || e.contains("AccountNotInitialized"), "{e}");
     // Take the fees directly from the pool program.
@@ -1906,4 +1986,119 @@ fn coins_must_have_a_vlvt_address() {
     let l = create(&mut env, &creator, s, 0, 0, 0).unwrap();
     assert!(l.mint.to_string().ends_with("vLvt"), "{}", l.mint);
 }
+/// A Token-2022 mint's extensions as (type, value), in order.
+fn mint_extensions(data: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    assert_eq!(data[165], 1, "account type: mint");
+    let mut out = vec![];
+    let mut i = 166;
+    while i + 4 <= data.len() {
+        let t = u16::from_le_bytes([data[i], data[i + 1]]);
+        let n = u16::from_le_bytes([data[i + 2], data[i + 3]]) as usize;
+        if t == 0 { break; }
+        out.push((t, data[i + 4..i + 4 + n].to_vec()));
+        i += 4 + n;
+    }
+    out
+}
 fn hex_bytes(h: &str) -> Vec<u8> { (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect() }
+
+// ───────────────────────────── Token-2022 switch ─────────────────────────────
+
+/// Coins made before the switch (classic SPL + Metaplex metadata) keep working on the new
+/// program: line, claims, trading, vesting, bonding into Velvet Pools, pool swaps, fee
+/// collection and hold-streak payouts.
+#[test]
+fn classic_coins_from_before_the_switch_keep_working() {
+    let mut env = setup_ext(vp_ext());
+    env.classic = true;
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(220), SOL, 0, 1_000).unwrap();
+    env.classic = false;
+    assert_eq!(env.svm.get_account(&l.mint).unwrap().owner, spl_token::ID);
+    let (metadata, _) = Pubkey::find_program_address(&[b"metadata", mpl().as_ref(), l.mint.as_ref()], &mpl());
+    assert_eq!(env.svm.get_account(&metadata).unwrap().owner, mpl(), "old coins keep their Metaplex metadata");
+    let ws = fill_line(&mut env, &l, 60);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &ws[0]).unwrap();
+    for w in &ws[..4] { claim(&mut env, &l, w).unwrap(); }
+    let held = tok(&env.svm, &l.ata(&ws[1].pubkey()));
+    assert!(held > 0);
+    trade(&mut env, &l, &ws[1], false, held / 4).unwrap();
+    advance(&mut env.svm, 10, 2_000);
+    send(&mut env.svm, vec![escrow_ix(&l, &creator, fairlaunch::instruction::ClaimVested {}.data())], &creator).unwrap();
+    assert_eq!(tok(&env.svm, &l.ata(&creator.pubkey())), launch_state(&env.svm, &l.launch).creator_tokens);
+    finish_curve(&mut env, &l);
+    graduate_velvet(&mut env, &l, &ws[1]).unwrap();
+    let trader = user(&mut env.svm, 20);
+    vp_swap(&mut env, &l, &trader, true, 5 * SOL, 1).unwrap();
+    let got = tok(&env.svm, &l.ata(&trader.pubkey()));
+    vp_swap(&mut env, &l, &trader, false, got / 2, 1).unwrap();
+    collect_velvet(&mut env, &l, &creator.pubkey(), &ws[5]).unwrap();
+    let dist = env.distributor.insecure_clone();
+    let pool = launch_state(&env.svm, &l.launch).reward_sol;
+    let b0 = bal(&env.svm, &ws[0].pubkey());
+    distribute(&mut env, &l, &dist, &[(ws[0].pubkey(), pool / 50)]).unwrap();
+    assert_eq!(bal(&env.svm, &ws[0].pubkey()) - b0, pool / 50);
+}
+
+/// Token-2022 coins always bond into Velvet Pools, even while new classic coins would go to
+/// Raydium; the Raydium path refuses them.
+#[test]
+fn token_2022_coins_always_bond_into_velvet_pools() {
+    let mut env = setup(); // Velvet Pools switched off
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(221), 0, 0, 0).unwrap();
+    let ws = fill_line(&mut env, &l, 60);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &ws[0]).unwrap();
+    finish_curve(&mut env, &l);
+    assert!(graduate(&mut env, &l, &ws[1]).is_err(), "Raydium path refuses Token-2022 coins");
+    graduate_velvet(&mut env, &l, &ws[1]).unwrap();
+    let s = launch_state(&env.svm, &l.launch);
+    assert!(s.graduated && s.pool_kind == 1);
+    let pool = vpools::pool(&l.mint);
+    let tv = vpools::vault(&pool, &l.mint);
+    assert_eq!(env.svm.get_account(&tv).unwrap().owner, t22(), "the pool's coin vault is a Token-2022 account");
+    // Distribute counts the pool's Token-2022 vault as locked supply.
+    let trader = user(&mut env.svm, 20);
+    vp_swap(&mut env, &l, &trader, true, 5 * SOL, 1).unwrap();
+    collect_velvet(&mut env, &l, &creator.pubkey(), &ws[2]).unwrap();
+    let dist = env.distributor.insecure_clone();
+    let pool_sol = launch_state(&env.svm, &l.launch).reward_sol;
+    distribute(&mut env, &l, &dist, &[(trader.pubkey(), pool_sol / 100)]).unwrap();
+}
+
+/// Velvet Pools only takes Token-2022 coins whose extensions are the metadata ones.
+#[test]
+fn velvet_pools_refuse_coins_with_other_extensions() {
+    let mut env = setup_ext(vp_ext());
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(222), 0, 0, 0).unwrap();
+    let ws = fill_line(&mut env, &l, 60);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &ws[0]).unwrap();
+    finish_curve(&mut env, &l);
+    // Relabel the metadata pointer as a group pointer (same size; transfers ignore both).
+    let mut a = env.svm.get_account(&l.mint).unwrap();
+    assert_eq!(u16::from_le_bytes([a.data[166], a.data[167]]), 18);
+    a.data[166..168].copy_from_slice(&20u16.to_le_bytes());
+    env.svm.set_account(l.mint, a).unwrap();
+    let e = graduate_velvet(&mut env, &l, &ws[1]).unwrap_err();
+    assert!(e.contains("WrongMint"), "{e}");
+}
+
+/// Wallets reach a Token-2022 coin through Token-2022 accounts only: a classic-program account
+/// or token program is refused.
+#[test]
+fn token_2022_coins_refuse_the_classic_token_program() {
+    let mut env = setup();
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(223), 0, 0, 0).unwrap();
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &creator).unwrap();
+    let u = user(&mut env.svm, 5);
+    let wrong = L { tp: spl_token::ID, vault: ata(&l.launch, &l.mint), ..l };
+    assert!(trade(&mut env, &wrong, &u, true, SOL / 10).is_err());
+    trade(&mut env, &l, &u, true, SOL / 10).unwrap();
+    assert!(tok(&env.svm, &l.ata(&u.pubkey())) > 0);
+}

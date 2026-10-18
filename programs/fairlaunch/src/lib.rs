@@ -2,7 +2,9 @@
 //!
 //! Anti-snipe launches:
 //!   1. The program deploys every coin. The mint is a PDA (Velvet grinds seeds so
-//!      addresses end in "vLvt"), metadata is written, minting is switched off.
+//!      addresses end in "vLvt") on Token-2022, with its name, symbol and logo link
+//!      stored in the mint and locked; minting is switched off. (Coins made before the
+//!      switch are classic SPL tokens with Metaplex metadata; they keep working.)
 //!   2. The creator's opening buy happens in the launch transaction, at the start
 //!      price, into an escrow that vests linearly.
 //!   3. The curve is locked for an opening window. Buyers commit SOL ("the line").
@@ -13,10 +15,11 @@
 //!      hold streak.
 //!   6. While bonding, no curve buy can take a wallet above 3% of the supply, and no
 //!      wallet's line commit (or the creator's opening buy) can buy more than 3% either.
-//!   7. When the curve fills, anyone can graduate it into a Raydium CPMM pool. All LP
-//!      is locked in Raydium's locker; its trading fees go to the treasury, the
-//!      creator and holders, and a quarter of the treasury's part goes back into the
-//!      pool as liquidity whose LP tokens are burned.
+//!   7. When the curve fills, anyone can graduate it into its Velvet Pools pool (no
+//!      withdraw: the liquidity is locked by design; fees go to holders, the creator and
+//!      Velvet). Classic coins could instead bond into a Raydium CPMM pool while Velvet
+//!      Pools was off: all LP locked in Raydium's locker, fees split the same way, and a
+//!      quarter of the treasury's part recycled into the pool with its LP burned.
 //!   8. Free launches: the creator only signs an approval message; whoever deploys
 //!      the coin (normally its first buyer) pays the account rent.
 
@@ -24,10 +27,13 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke_signed;
 use anchor_lang::system_program;
 use anchor_spl::associated_token::{self, AssociatedToken};
-use anchor_spl::metadata::{
-    create_metadata_accounts_v3, mpl_token_metadata::types::DataV2, CreateMetadataAccountsV3, Metadata,
+use anchor_spl::metadata::Metadata;
+use anchor_spl::token::{self, spl_token, Mint, Token, TokenAccount};
+use anchor_spl::token_2022::Token2022;
+use anchor_spl::token_2022_extensions::spl_token_metadata_interface;
+use anchor_spl::token_interface::{
+    self as tokx, spl_token_2022, Mint as CoinMint, TokenAccount as CoinAccount, TokenInterface,
 };
-use anchor_spl::token::{self, spl_token, Mint, SetAuthority, Token, TokenAccount, Transfer};
 
 pub mod errors;
 pub mod math;
@@ -182,6 +188,45 @@ fn token_amount(acc: &AccountInfo) -> Result<u64> {
 
 use anchor_lang::solana_program::program_pack::Pack;
 
+/// Move coin tokens with whichever token program the coin uses (classic coins from before the
+/// switch, Token-2022 coins since). `transfer_checked` works for both.
+#[allow(clippy::too_many_arguments)]
+fn send_coin<'info>(
+    token_program: &AccountInfo<'info>,
+    mint: &AccountInfo<'info>,
+    from: &AccountInfo<'info>,
+    to: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    amount: u64,
+    signer: &[&[&[u8]]],
+) -> Result<()> {
+    tokx::transfer_checked(
+        CpiContext::new_with_signer(
+            token_program.clone(),
+            tokx::TransferChecked { from: from.clone(), mint: mint.clone(), to: to.clone(), authority: authority.clone() },
+            signer,
+        ),
+        amount,
+        DECIMALS,
+    )
+}
+
+fn is_token_program(key: &Pubkey) -> bool {
+    *key == token::ID || *key == spl_token_2022::ID
+}
+
+/// A coin holder's token account from either token program: (mint, owner, amount).
+fn read_holder_account(acc: &AccountInfo) -> Result<(Pubkey, Pubkey, u64)> {
+    require!(is_token_program(acc.owner), FairError::BadRewardAccount);
+    let data = acc.try_borrow_data()?;
+    // A plain account is exactly 165 bytes; a Token-2022 account with extensions is longer and
+    // marks itself as an account (type 2) right after the base layout.
+    require!(data.len() == spl_token::state::Account::LEN || (data.len() > spl_token::state::Account::LEN && data[spl_token::state::Account::LEN] == 2), FairError::BadRewardAccount);
+    let ta = spl_token::state::Account::unpack_from_slice(&data).map_err(|_| error!(FairError::BadRewardAccount))?;
+    require!(ta.state == spl_token::state::AccountState::Initialized, FairError::BadRewardAccount);
+    Ok((ta.mint, ta.owner, ta.amount))
+}
+
 /// Read a commitment of either layout (before/after `claimed` and `refunded` were added).
 fn read_commitment(info: &AccountInfo) -> Result<Commitment> {
     require!(info.owner == &crate::ID, FairError::BadCommitment);
@@ -321,8 +366,8 @@ fn check_approval(ix_sysvar: &AccountInfo, creator: &Pubkey, digest: &[u8; 32]) 
     Ok(())
 }
 
-/// Fill in a new launch and mint the coin: metadata (immutable, update authority is
-/// the launch PDA), the fixed supply into the vault, minting switched off.
+/// Fill in a new launch and mint the coin (Token-2022): metadata inside the mint, made
+/// immutable, the fixed supply into the vault, minting switched off.
 #[allow(clippy::too_many_arguments)]
 fn init_coin<'info>(
     cfg: &Config,
@@ -365,40 +410,64 @@ fn init_coin<'info>(
     l.grad_bump = Pubkey::find_program_address(&[GRAD_SEED, l.key().as_ref()], &crate::ID).1;
 
     launch_signer!(l, signer);
-    create_metadata_accounts_v3(
+    // Token-2022 keeps the name, symbol and logo link inside the mint itself (no separate
+    // metadata account). The mint grows to hold them, so it needs the extra rent first.
+    let meta = spl_token_metadata_interface::state::TokenMetadata {
+        update_authority: Default::default(),
+        mint: a.mint.key(),
+        name: name.clone(),
+        symbol: symbol.clone(),
+        uri: uri.clone(),
+        additional_metadata: vec![],
+    };
+    let new_len = a.mint.data_len().checked_add(meta.tlv_size_of()?).ok_or(FairError::Overflow)?;
+    let need = Rent::get()?.minimum_balance(new_len).saturating_sub(a.mint.lamports());
+    pay_from_user(a.system, a.payer, a.mint, need)?;
+    tokx::token_metadata_initialize(
         CpiContext::new_with_signer(
-            a.metadata_program.clone(),
-            CreateMetadataAccountsV3 {
-                metadata: a.metadata.clone(),
-                mint: a.mint.clone(),
-                mint_authority: l.to_account_info(),
-                payer: a.payer.clone(),
+            a.token_program.clone(),
+            tokx::TokenMetadataInitialize {
+                program_id: a.token_program.clone(),
+                metadata: a.mint.clone(),
                 update_authority: l.to_account_info(),
-                system_program: a.system.clone(),
-                rent: a.rent.clone(),
+                mint_authority: l.to_account_info(),
+                mint: a.mint.clone(),
             },
             signer,
         ),
-        DataV2 { name, symbol, uri, seller_fee_basis_points: 0, creators: None, collection: None, uses: None },
-        false,
-        true,
-        None,
+        name,
+        symbol,
+        uri,
     )?;
-    token::mint_to(
+    // Nobody can ever change the name, symbol or logo link.
+    tokx::token_metadata_update_authority(
         CpiContext::new_with_signer(
             a.token_program.clone(),
-            token::MintTo { mint: a.mint.clone(), to: a.vault.clone(), authority: l.to_account_info() },
+            tokx::TokenMetadataUpdateAuthority {
+                program_id: a.token_program.clone(),
+                metadata: a.mint.clone(),
+                current_authority: l.to_account_info(),
+                new_authority: l.to_account_info(),
+            },
+            signer,
+        ),
+        Default::default(),
+    )?;
+    tokx::mint_to(
+        CpiContext::new_with_signer(
+            a.token_program.clone(),
+            tokx::MintTo { mint: a.mint.clone(), to: a.vault.clone(), authority: l.to_account_info() },
             signer,
         ),
         TOTAL_SUPPLY,
     )?;
-    token::set_authority(
+    tokx::set_authority(
         CpiContext::new_with_signer(
             a.token_program.clone(),
-            SetAuthority { current_authority: l.to_account_info(), account_or_mint: a.mint.clone() },
+            tokx::SetAuthority { current_authority: l.to_account_info(), account_or_mint: a.mint.clone() },
             signer,
         ),
-        spl_token::instruction::AuthorityType::MintTokens,
+        spl_token_2022::instruction::AuthorityType::MintTokens,
         None,
     )?;
     Ok(())
@@ -407,11 +476,8 @@ fn init_coin<'info>(
 struct CoinAccounts<'a, 'info> {
     mint: &'a AccountInfo<'info>,
     vault: &'a AccountInfo<'info>,
-    metadata: &'a AccountInfo<'info>,
-    metadata_program: &'a AccountInfo<'info>,
     payer: &'a AccountInfo<'info>,
     system: &'a AccountInfo<'info>,
-    rent: &'a AccountInfo<'info>,
     token_program: &'a AccountInfo<'info>,
 }
 
@@ -578,14 +644,11 @@ pub mod fairlaunch {
         require!(creator_buy_lamports <= cfg.max_creator_buy, FairError::CreatorBuyTooLarge);
         require_keys_eq!(ctx.accounts.treasury.key(), cfg.treasury, FairError::WrongTreasury);
         let (bump, mint_bump) = (ctx.bumps.launch, ctx.bumps.mint);
-        let (mint, vault, metadata, metadata_program, creator_info, system, rent, token_prog) = (
+        let (mint, vault, creator_info, system, token_prog) = (
             ctx.accounts.mint.to_account_info(),
             ctx.accounts.vault.to_account_info(),
-            ctx.accounts.metadata.to_account_info(),
-            ctx.accounts.metadata_program.to_account_info(),
             ctx.accounts.creator.to_account_info(),
             ctx.accounts.system_program.to_account_info(),
-            ctx.accounts.rent.to_account_info(),
             ctx.accounts.token_program.to_account_info(),
         );
         let creator_key = ctx.accounts.creator.key();
@@ -594,7 +657,7 @@ pub mod fairlaunch {
             cfg,
             l,
             creator_key,
-            CoinAccounts { mint: &mint, vault: &vault, metadata: &metadata, metadata_program: &metadata_program, payer: &creator_info, system: &system, rent: &rent, token_program: &token_prog },
+            CoinAccounts { mint: &mint, vault: &vault, payer: &creator_info, system: &system, token_program: &token_prog },
             seed, name, symbol, uri, auction_slots, min_raise, vest_secs, bump, mint_bump,
         )?;
         pay_storage_fee(cfg, &ctx.accounts.storage.to_account_info(), &creator_info, &system)?;
@@ -609,14 +672,7 @@ pub mod fairlaunch {
             let creator = ctx.accounts.creator.to_account_info();
             pay_from_user(&system, &creator, &l.to_account_info(), q.sol_used)?;
             route_fee(cfg, l, fee, cfg.base_fee_bps, Some((&system, &creator)), &ctx.accounts.treasury.to_account_info())?;
-            token::transfer(
-                CpiContext::new_with_signer(
-                    token_prog,
-                    Transfer { from: ctx.accounts.vault.to_account_info(), to: ctx.accounts.escrow.to_account_info(), authority: l.to_account_info() },
-                    signer,
-                ),
-                q.tokens_out,
-            )?;
+            send_coin(&token_prog, &mint, &ctx.accounts.vault.to_account_info(), &ctx.accounts.escrow.to_account_info(), &l.to_account_info(), q.tokens_out, signer)?;
             l.virtual_sol += q.sol_used;
             l.virtual_token -= q.tokens_out;
             l.real_sol += q.sol_used;
@@ -665,14 +721,11 @@ pub mod fairlaunch {
 
         let cfg = &ctx.accounts.config;
         let (bump, mint_bump) = (ctx.bumps.launch, ctx.bumps.mint);
-        let (mint, vault, metadata, metadata_program, payer, system, rent, token_prog) = (
+        let (mint, vault, payer, system, token_prog) = (
             ctx.accounts.mint.to_account_info(),
             ctx.accounts.vault.to_account_info(),
-            ctx.accounts.metadata.to_account_info(),
-            ctx.accounts.metadata_program.to_account_info(),
             ctx.accounts.payer.to_account_info(),
             ctx.accounts.system_program.to_account_info(),
-            ctx.accounts.rent.to_account_info(),
             ctx.accounts.token_program.to_account_info(),
         );
         let payer_key = payer.key();
@@ -681,7 +734,7 @@ pub mod fairlaunch {
             cfg,
             l,
             creator,
-            CoinAccounts { mint: &mint, vault: &vault, metadata: &metadata, metadata_program: &metadata_program, payer: &payer, system: &system, rent: &rent, token_program: &token_prog },
+            CoinAccounts { mint: &mint, vault: &vault, payer: &payer, system: &system, token_program: &token_prog },
             seed, name, symbol, uri, auction_slots, min_raise, vest_secs, bump, mint_bump,
         )?;
         pay_storage_fee(cfg, &ctx.accounts.storage.to_account_info(), &payer, &system)?;
@@ -840,14 +893,7 @@ pub mod fairlaunch {
         require!(tokens > 0 || refund > 0 || share == 0, FairError::NothingToClaim);
         if tokens > 0 {
             launch_signer!(l, signer);
-            token::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    Transfer { from: ctx.accounts.vault.to_account_info(), to: ctx.accounts.user_ata.to_account_info(), authority: l.to_account_info() },
-                    signer,
-                ),
-                tokens,
-            )?;
+            send_coin(&ctx.accounts.token_program.to_account_info(), &ctx.accounts.mint.to_account_info(), &ctx.accounts.vault.to_account_info(), &ctx.accounts.user_ata.to_account_info(), &l.to_account_info(), tokens, signer)?;
             l.unclaimed_batch = l.unclaimed_batch.saturating_sub(tokens);
         }
         if refund > 0 {
@@ -895,14 +941,7 @@ pub mod fairlaunch {
         let amount = unlocked.saturating_sub(l.creator_claimed);
         require!(amount > 0, FairError::NothingToClaim);
         launch_signer!(l, signer);
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer { from: ctx.accounts.escrow.to_account_info(), to: ctx.accounts.creator_ata.to_account_info(), authority: l.to_account_info() },
-                signer,
-            ),
-            amount,
-        )?;
+        send_coin(&ctx.accounts.token_program.to_account_info(), &ctx.accounts.mint.to_account_info(), &ctx.accounts.escrow.to_account_info(), &ctx.accounts.creator_ata.to_account_info(), &l.to_account_info(), amount, signer)?;
         l.creator_claimed += amount;
         emit!(CreatorVested { launch: l.key(), amount, total_claimed: l.creator_claimed });
         Ok(())
@@ -917,14 +956,7 @@ pub mod fairlaunch {
         require!(tokens > 0 || sol > 0, FairError::NothingToClaim);
         launch_signer!(l, signer);
         if tokens > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    Transfer { from: ctx.accounts.escrow.to_account_info(), to: ctx.accounts.vault.to_account_info(), authority: l.to_account_info() },
-                    signer,
-                ),
-                tokens,
-            )?;
+            send_coin(&ctx.accounts.token_program.to_account_info(), &ctx.accounts.mint.to_account_info(), &ctx.accounts.escrow.to_account_info(), &ctx.accounts.vault.to_account_info(), &l.to_account_info(), tokens, signer)?;
         }
         l.real_sol = l.real_sol.checked_sub(sol).ok_or(FairError::Overflow)?;
         pay_from_pda(&l.to_account_info(), &ctx.accounts.creator.to_account_info(), sol)?;
@@ -975,14 +1007,7 @@ pub mod fairlaunch {
         pay_from_user(&system, &user, &l.to_account_info(), q.sol_used)?;
         let to_holders = route_fee(cfg, l, fee, fee_bps, Some((&system, &user)), &ctx.accounts.treasury.to_account_info())?;
         launch_signer!(l, signer);
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer { from: ctx.accounts.vault.to_account_info(), to: ctx.accounts.user_ata.to_account_info(), authority: l.to_account_info() },
-                signer,
-            ),
-            q.tokens_out,
-        )?;
+        send_coin(&ctx.accounts.token_program.to_account_info(), &ctx.accounts.mint.to_account_info(), &ctx.accounts.vault.to_account_info(), &ctx.accounts.user_ata.to_account_info(), &l.to_account_info(), q.tokens_out, signer)?;
         l.virtual_sol += q.sol_used;
         l.virtual_token -= q.tokens_out;
         l.real_sol += q.sol_used;
@@ -1021,13 +1046,7 @@ pub mod fairlaunch {
         let out = gross.checked_sub(fee).ok_or(FairError::Overflow)?;
         require!(out >= min_lamports_out, FairError::Slippage);
 
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer { from: ctx.accounts.user_ata.to_account_info(), to: ctx.accounts.vault.to_account_info(), authority: ctx.accounts.user.to_account_info() },
-            ),
-            tokens_in,
-        )?;
+        send_coin(&ctx.accounts.token_program.to_account_info(), &ctx.accounts.mint.to_account_info(), &ctx.accounts.user_ata.to_account_info(), &ctx.accounts.vault.to_account_info(), &ctx.accounts.user.to_account_info(), tokens_in, &[])?;
         l.virtual_sol -= gross;
         l.virtual_token += tokens_in;
         l.real_sol -= gross;
@@ -1081,7 +1100,11 @@ pub mod fairlaunch {
 
         // Circulating supply: everything not held by the curve vault, the creator
         // escrow or the Raydium pool.
-        let mut locked = (ctx.accounts.vault.amount as u128) + (ctx.accounts.escrow.amount as u128);
+        let coin_prog = *ctx.accounts.mint.to_account_info().owner;
+        let vault = ctx.accounts.vault.to_account_info();
+        require_keys_eq!(vault.key(), associated_token::get_associated_token_address_with_program_id(&l.key(), &l.mint, &coin_prog), FairError::BadRewardAccount);
+        require_keys_eq!(*vault.owner, coin_prog, FairError::BadRewardAccount);
+        let mut locked = (token_amount(&vault)? as u128) + (ctx.accounts.escrow.amount as u128);
         if l.graduated {
             let pv = ctx.accounts.pool_token_vault.as_ref().ok_or(FairError::WrongPoolAccount)?;
             let expected = if l.pool_kind == 1 { vpools::vault(&l.pool, &l.mint) } else { raydium::vault(&cfg.cpmm_program, &l.pool, &l.mint) };
@@ -1096,16 +1119,13 @@ pub mod fairlaunch {
         for (i, amount) in amounts.iter().enumerate() {
             let token_acc = &rem[i * 2];
             let wallet = &rem[i * 2 + 1];
-            require_keys_eq!(*token_acc.owner, token::ID, FairError::BadRewardAccount);
             require!(wallet.key() != launch_info.key(), FairError::BadRewardAccount);
-            let data = token_acc.try_borrow_data()?;
-            let ta = spl_token::state::Account::unpack_from_slice(&data).map_err(|_| error!(FairError::BadRewardAccount))?;
-            drop(data);
-            require!(ta.mint == l.mint && ta.owner == wallet.key() && ta.amount > 0, FairError::BadRewardAccount);
+            let (ta_mint, ta_owner, ta_amount) = read_holder_account(token_acc)?;
+            require!(ta_mint == l.mint && ta_owner == wallet.key() && ta_amount > 0, FairError::BadRewardAccount);
             require!(wallet.is_writable, FairError::BadRewardAccount);
             // amount / budget <= MAX_STREAK_MULT * balance / circulating
             require!(
-                (*amount as u128) * circulating <= MAX_STREAK_MULT * (ta.amount as u128) * budget,
+                (*amount as u128) * circulating <= MAX_STREAK_MULT * (ta_amount as u128) * budget,
                 FairError::RewardAboveShare
             );
             pay_from_pda(&launch_info, wallet, *amount)?;
@@ -1139,8 +1159,8 @@ pub mod fairlaunch {
         Ok(())
     }
 
-    /// Permissionless, step 2: create the Raydium CPMM pool (only while new coins still bond
-    /// into Raydium; see `graduate_velvet`).
+    /// Permissionless, step 2: create the Raydium CPMM pool (classic coins only, and only while
+    /// Velvet Pools is off; see `graduate_velvet`).
     pub fn graduate(ctx: Context<Graduate>) -> Result<()> {
         let cfg = &ctx.accounts.config;
         let a = &ctx.accounts;
@@ -1206,7 +1226,7 @@ pub mod fairlaunch {
             token::transfer(
                 CpiContext::new_with_signer(
                     token_prog.clone(),
-                    Transfer { from: a.vault.to_account_info(), to: a.grad_token.to_account_info(), authority: l.to_account_info() },
+                    token::Transfer { from: a.vault.to_account_info(), to: a.grad_token.to_account_info(), authority: l.to_account_info() },
                     lsig,
                 ),
                 lp_reserve,
@@ -1266,14 +1286,18 @@ pub mod fairlaunch {
         Ok(())
     }
 
-    /// Permissionless, step 2 when new coins bond into Velvet Pools: create the coin's pool with
+    /// Permissionless, step 2 for Token-2022 coins, and for classic coins while Velvet Pools is
+    /// on: create the coin's pool with
     /// the curve's SOL and the LP reserve. Velvet Pools has no withdraw at all, so the liquidity
     /// is locked by design (no locker step).
     pub fn graduate_velvet(ctx: Context<GraduateVelvet>) -> Result<()> {
         let cfg = &ctx.accounts.config;
         let a = &ctx.accounts;
         require_keys_eq!(a.treasury.key(), cfg.treasury, FairError::WrongTreasury);
-        require!(a.config_ext.params.velvet_pools, FairError::WrongPoolAccount);
+        // Token-2022 coins always bond into Velvet Pools; classic coins only while it's switched on.
+        let coin_prog = a.coin_token_program.key();
+        require_keys_eq!(*a.mint.to_account_info().owner, coin_prog, FairError::WrongPoolAccount);
+        require!(a.config_ext.params.velvet_pools || coin_prog == spl_token_2022::ID, FairError::WrongPoolAccount);
         require!(a.launch.grad_prepared && !a.launch.graduated, FairError::NotComplete);
         let launch_key = a.launch.key();
         let mint_key = a.mint.key();
@@ -1285,12 +1309,13 @@ pub mod fairlaunch {
         require_keys_eq!(a.pool_sol_vault.key(), vpools::vault(&pool, &wsol), FairError::WrongPoolAccount);
         require_keys_eq!(a.pool_token_vault.key(), vpools::vault(&pool, &mint_key), FairError::WrongPoolAccount);
         require_keys_eq!(a.grad_wsol.key(), associated_token::get_associated_token_address(&grad, &wsol), FairError::WrongPoolAccount);
-        require_keys_eq!(a.grad_token.key(), associated_token::get_associated_token_address(&grad, &mint_key), FairError::WrongPoolAccount);
+        require_keys_eq!(a.grad_token.key(), associated_token::get_associated_token_address_with_program_id(&grad, &mint_key, &coin_prog), FairError::WrongPoolAccount);
 
         let grad_bump = a.launch.grad_bump;
         grad_signer!(launch_key, grad_bump, gsig);
         let system = a.system_program.to_account_info();
         let token_prog = a.token_program.to_account_info();
+        let coin_tp = a.coin_token_program.to_account_info();
         let pool_sol = a.launch.grad_pool_sol;
         let grad_fee = a.launch.grad_fee_paid;
         // The pool opens at the curve's last price: tokens beyond what pool_sol buys at that price
@@ -1299,7 +1324,7 @@ pub mod fairlaunch {
         let lp_reserve = (a.launch.lp_reserve as u128).min(at_price) as u64;
         let burn = a.launch.lp_reserve - lp_reserve;
 
-        for (ata, m) in [(a.grad_wsol.to_account_info(), a.wsol_mint.to_account_info()), (a.grad_token.to_account_info(), a.mint.to_account_info())] {
+        for (ata, m, tp) in [(a.grad_wsol.to_account_info(), a.wsol_mint.to_account_info(), &token_prog), (a.grad_token.to_account_info(), a.mint.to_account_info(), &coin_tp)] {
             associated_token::create_idempotent(CpiContext::new_with_signer(
                 a.associated_token_program.to_account_info(),
                 associated_token::Create {
@@ -1308,7 +1333,7 @@ pub mod fairlaunch {
                     authority: a.grad_auth.to_account_info(),
                     mint: m,
                     system_program: system.clone(),
-                    token_program: token_prog.clone(),
+                    token_program: tp.clone(),
                 },
                 gsig,
             ))?;
@@ -1318,10 +1343,10 @@ pub mod fairlaunch {
         if burn > 0 {
             let l = &a.launch;
             launch_signer!(l, lsig);
-            token::burn(
+            tokx::burn(
                 CpiContext::new_with_signer(
-                    token_prog.clone(),
-                    token::Burn { mint: a.mint.to_account_info(), from: a.vault.to_account_info(), authority: l.to_account_info() },
+                    coin_tp.clone(),
+                    tokx::Burn { mint: a.mint.to_account_info(), from: a.vault.to_account_info(), authority: l.to_account_info() },
                     lsig,
                 ),
                 burn,
@@ -1330,21 +1355,14 @@ pub mod fairlaunch {
         {
             let l = &a.launch;
             launch_signer!(l, lsig);
-            token::transfer(
-                CpiContext::new_with_signer(
-                    token_prog.clone(),
-                    Transfer { from: a.vault.to_account_info(), to: a.grad_token.to_account_info(), authority: l.to_account_info() },
-                    lsig,
-                ),
-                lp_reserve,
-            )?;
+            send_coin(&coin_tp, &a.mint.to_account_info(), &a.vault.to_account_info(), &a.grad_token.to_account_info(), &l.to_account_info(), lp_reserve, lsig)?;
         }
         invoke_signed(
-            &vpools::initialize_ix(grad, mint_key, wsol, a.grad_wsol.key(), a.grad_token.key(), launch_key, grad_bump, pool_sol, lp_reserve),
+            &vpools::initialize_ix(grad, mint_key, wsol, a.grad_wsol.key(), a.grad_token.key(), launch_key, grad_bump, pool_sol, lp_reserve, coin_prog),
             &[
                 a.grad_auth.to_account_info(), a.mint.to_account_info(), a.wsol_mint.to_account_info(), a.pool.to_account_info(),
                 a.pool_vault_auth.to_account_info(), a.pool_sol_vault.to_account_info(), a.pool_token_vault.to_account_info(),
-                a.grad_wsol.to_account_info(), a.grad_token.to_account_info(), token_prog.clone(), system.clone(), a.pools_program.to_account_info(),
+                a.grad_wsol.to_account_info(), a.grad_token.to_account_info(), token_prog.clone(), system.clone(), coin_tp.clone(), a.pools_program.to_account_info(),
             ],
             gsig,
         )?;
@@ -1767,22 +1785,23 @@ pub struct CreateLaunch<'info> {
     /// CHECK: validated against config.treasury
     #[account(mut)]
     pub treasury: UncheckedAccount<'info>,
-    #[account(init, payer = creator, seeds = [MINT_SEED, seed.as_ref()], bump, mint::decimals = DECIMALS, mint::authority = launch)]
-    pub mint: Box<Account<'info, Mint>>,
+    /// A Token-2022 mint whose metadata lives in the mint itself (no freeze authority, no
+    /// other extensions).
+    #[account(
+        init, payer = creator, seeds = [MINT_SEED, seed.as_ref()], bump,
+        mint::decimals = DECIMALS, mint::authority = launch, mint::token_program = token_program,
+        extensions::metadata_pointer::metadata_address = mint,
+    )]
+    pub mint: Box<InterfaceAccount<'info, CoinMint>>,
     #[account(init, payer = creator, space = 8 + Launch::INIT_SPACE, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump)]
     pub launch: Box<Account<'info, Launch>>,
-    #[account(init, payer = creator, associated_token::mint = mint, associated_token::authority = launch)]
-    pub vault: Box<Account<'info, TokenAccount>>,
-    #[account(init, payer = creator, seeds = [ESCROW_SEED, launch.key().as_ref()], bump, token::mint = mint, token::authority = launch)]
-    pub escrow: Box<Account<'info, TokenAccount>>,
-    /// CHECK: created by Metaplex (it checks the PDA)
-    #[account(mut)]
-    pub metadata: UncheckedAccount<'info>,
-    pub metadata_program: Program<'info, Metadata>,
-    pub token_program: Program<'info, Token>,
+    #[account(init, payer = creator, associated_token::mint = mint, associated_token::authority = launch, associated_token::token_program = token_program)]
+    pub vault: Box<InterfaceAccount<'info, CoinAccount>>,
+    #[account(init, payer = creator, seeds = [ESCROW_SEED, launch.key().as_ref()], bump, token::mint = mint, token::authority = launch, token::token_program = token_program)]
+    pub escrow: Box<InterfaceAccount<'info, CoinAccount>>,
+    pub token_program: Program<'info, Token2022>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
     /// CHECK: checked against config.storage_wallet when storage is on
     #[account(mut)]
     pub storage: UncheckedAccount<'info>,
@@ -1798,25 +1817,24 @@ pub struct CreateLaunchSigned<'info> {
     pub payer: Signer<'info>,
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Box<Account<'info, Config>>,
-    #[account(init, payer = payer, seeds = [MINT_SEED, seed.as_ref()], bump, mint::decimals = DECIMALS, mint::authority = launch)]
-    pub mint: Box<Account<'info, Mint>>,
+    #[account(
+        init, payer = payer, seeds = [MINT_SEED, seed.as_ref()], bump,
+        mint::decimals = DECIMALS, mint::authority = launch, mint::token_program = token_program,
+        extensions::metadata_pointer::metadata_address = mint,
+    )]
+    pub mint: Box<InterfaceAccount<'info, CoinMint>>,
     #[account(init, payer = payer, space = 8 + Launch::INIT_SPACE, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump)]
     pub launch: Box<Account<'info, Launch>>,
-    #[account(init, payer = payer, associated_token::mint = mint, associated_token::authority = launch)]
-    pub vault: Box<Account<'info, TokenAccount>>,
-    #[account(init, payer = payer, seeds = [ESCROW_SEED, launch.key().as_ref()], bump, token::mint = mint, token::authority = launch)]
-    pub escrow: Box<Account<'info, TokenAccount>>,
-    /// CHECK: created by Metaplex (it checks the PDA)
-    #[account(mut)]
-    pub metadata: UncheckedAccount<'info>,
+    #[account(init, payer = payer, associated_token::mint = mint, associated_token::authority = launch, associated_token::token_program = token_program)]
+    pub vault: Box<InterfaceAccount<'info, CoinAccount>>,
+    #[account(init, payer = payer, seeds = [ESCROW_SEED, launch.key().as_ref()], bump, token::mint = mint, token::authority = launch, token::token_program = token_program)]
+    pub escrow: Box<InterfaceAccount<'info, CoinAccount>>,
     /// CHECK: the instructions sysvar, read to find the creator's Ed25519 approval
     #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
     pub instructions: UncheckedAccount<'info>,
-    pub metadata_program: Program<'info, Metadata>,
-    pub token_program: Program<'info, Token>,
+    pub token_program: Program<'info, Token2022>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
     /// CHECK: checked against config.storage_wallet when storage is on
     #[account(mut)]
     pub storage: UncheckedAccount<'info>,
@@ -1884,16 +1902,18 @@ pub struct Claim<'info> {
     pub user: Signer<'info>,
     #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
     pub launch: Box<Account<'info, Launch>>,
-    pub mint: Box<Account<'info, Mint>>,
+    #[account(mint::token_program = token_program)]
+    pub mint: Box<InterfaceAccount<'info, CoinMint>>,
     /// CHECK: read by hand so commitments from before partial claims still work; the seeds pin it
     /// to this launch and user, and the handler checks owner, discriminator and fields.
     #[account(mut, seeds = [COMMIT_SEED, launch.key().as_ref(), user.key().as_ref()], bump)]
     pub commitment: UncheckedAccount<'info>,
-    #[account(mut, associated_token::mint = mint, associated_token::authority = launch)]
-    pub vault: Box<Account<'info, TokenAccount>>,
-    #[account(init_if_needed, payer = user, associated_token::mint = mint, associated_token::authority = user)]
-    pub user_ata: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    #[account(mut, associated_token::mint = mint, associated_token::authority = launch, associated_token::token_program = token_program)]
+    pub vault: Box<InterfaceAccount<'info, CoinAccount>>,
+    #[account(init_if_needed, payer = user, associated_token::mint = mint, associated_token::authority = user, associated_token::token_program = token_program)]
+    pub user_ata: Box<InterfaceAccount<'info, CoinAccount>>,
+    /// The coin's token program: Token-2022 for new coins, classic for older ones.
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
     #[account(init_if_needed, payer = user, space = 8 + Pass::INIT_SPACE, seeds = [PASS_SEED, user.key().as_ref()], bump)]
@@ -1908,14 +1928,15 @@ pub struct CreatorEscrow<'info> {
     pub creator: Signer<'info>,
     #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint, has_one = creator)]
     pub launch: Box<Account<'info, Launch>>,
-    pub mint: Box<Account<'info, Mint>>,
+    #[account(mint::token_program = token_program)]
+    pub mint: Box<InterfaceAccount<'info, CoinMint>>,
     #[account(mut, seeds = [ESCROW_SEED, launch.key().as_ref()], bump)]
-    pub escrow: Box<Account<'info, TokenAccount>>,
-    #[account(mut, associated_token::mint = mint, associated_token::authority = launch)]
-    pub vault: Box<Account<'info, TokenAccount>>,
-    #[account(init_if_needed, payer = creator, associated_token::mint = mint, associated_token::authority = creator)]
-    pub creator_ata: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub escrow: Box<InterfaceAccount<'info, CoinAccount>>,
+    #[account(mut, associated_token::mint = mint, associated_token::authority = launch, associated_token::token_program = token_program)]
+    pub vault: Box<InterfaceAccount<'info, CoinAccount>>,
+    #[account(init_if_needed, payer = creator, associated_token::mint = mint, associated_token::authority = creator, associated_token::token_program = token_program)]
+    pub creator_ata: Box<InterfaceAccount<'info, CoinAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
@@ -1931,12 +1952,13 @@ pub struct TradeCtx<'info> {
     pub treasury: UncheckedAccount<'info>,
     #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
     pub launch: Box<Account<'info, Launch>>,
-    pub mint: Box<Account<'info, Mint>>,
-    #[account(mut, associated_token::mint = mint, associated_token::authority = launch)]
-    pub vault: Box<Account<'info, TokenAccount>>,
-    #[account(init_if_needed, payer = user, associated_token::mint = mint, associated_token::authority = user)]
-    pub user_ata: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    #[account(mint::token_program = token_program)]
+    pub mint: Box<InterfaceAccount<'info, CoinMint>>,
+    #[account(mut, associated_token::mint = mint, associated_token::authority = launch, associated_token::token_program = token_program)]
+    pub vault: Box<InterfaceAccount<'info, CoinAccount>>,
+    #[account(init_if_needed, payer = user, associated_token::mint = mint, associated_token::authority = user, associated_token::token_program = token_program)]
+    pub user_ata: Box<InterfaceAccount<'info, CoinAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
     /// CHECK: the user's line commitment for this coin (usually empty). Its address is fixed by
@@ -1954,11 +1976,11 @@ pub struct Distribute<'info> {
     pub config: Box<Account<'info, Config>>,
     #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
     pub launch: Box<Account<'info, Launch>>,
-    pub mint: Box<Account<'info, Mint>>,
-    #[account(associated_token::mint = mint, associated_token::authority = launch)]
-    pub vault: Box<Account<'info, TokenAccount>>,
-    #[account(seeds = [ESCROW_SEED, launch.key().as_ref()], bump)]
-    pub escrow: Box<Account<'info, TokenAccount>>,
+    pub mint: Box<InterfaceAccount<'info, CoinMint>>,
+    /// CHECK: the curve vault, ATA(launch, mint) under the coin's token program (checked in the handler)
+    pub vault: UncheckedAccount<'info>,
+    #[account(seeds = [ESCROW_SEED, launch.key().as_ref()], bump, token::mint = mint)]
+    pub escrow: Box<InterfaceAccount<'info, CoinAccount>>,
     /// CHECK: the pool's token vault after graduation (checked in the handler); None before.
     pub pool_token_vault: Option<UncheckedAccount<'info>>,
 }
@@ -2054,10 +2076,10 @@ pub struct GraduateVelvet<'info> {
     pub treasury: UncheckedAccount<'info>,
     #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
     pub launch: Box<Account<'info, Launch>>,
-    #[account(mut)]
-    pub mint: Box<Account<'info, Mint>>,
-    #[account(mut, associated_token::mint = mint, associated_token::authority = launch)]
-    pub vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, mint::token_program = coin_token_program)]
+    pub mint: Box<InterfaceAccount<'info, CoinMint>>,
+    #[account(mut, associated_token::mint = mint, associated_token::authority = launch, associated_token::token_program = coin_token_program)]
+    pub vault: Box<InterfaceAccount<'info, CoinAccount>>,
     /// CHECK: system-owned PDA that creates the pool and owns its fees
     #[account(mut, seeds = [GRAD_SEED, launch.key().as_ref()], bump = launch.grad_bump)]
     pub grad_auth: UncheckedAccount<'info>,
@@ -2084,9 +2106,12 @@ pub struct GraduateVelvet<'info> {
     /// CHECK: Velvet Pools vault PDA, checked in the handler
     #[account(mut)]
     pub pool_token_vault: UncheckedAccount<'info>,
+    /// Classic token program (wrapped SOL).
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
+    /// The coin's token program.
+    pub coin_token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
@@ -2100,7 +2125,7 @@ pub struct CollectVelvetFees<'info> {
     pub treasury: UncheckedAccount<'info>,
     #[account(mut, seeds = [LAUNCH_SEED, mint.key().as_ref()], bump = launch.bump, has_one = mint)]
     pub launch: Box<Account<'info, Launch>>,
-    pub mint: Box<Account<'info, Mint>>,
+    pub mint: Box<InterfaceAccount<'info, CoinMint>>,
     /// CHECK: the coin's creator, checked against the launch
     #[account(mut)]
     pub creator: UncheckedAccount<'info>,

@@ -16,7 +16,7 @@ pub fn vault(pool: &Pubkey, mint: &Pubkey) -> Pubkey { Pubkey::find_program_addr
 pub fn vault_auth() -> Pubkey { Pubkey::find_program_address(&[b"vault_auth"], &ID).0 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn initialize_ix(creator: Pubkey, token_mint: Pubkey, wsol: Pubkey, creator_sol: Pubkey, creator_token: Pubkey, launch: Pubkey, grad_bump: u8, sol_amount: u64, token_amount: u64) -> Instruction {
+pub fn initialize_ix(creator: Pubkey, token_mint: Pubkey, wsol: Pubkey, creator_sol: Pubkey, creator_token: Pubkey, launch: Pubkey, grad_bump: u8, sol_amount: u64, token_amount: u64, coin_token_program: Pubkey) -> Instruction {
     let pool = pool(&token_mint);
     let mut data = INITIALIZE.to_vec();
     data.extend_from_slice(launch.as_ref());
@@ -37,6 +37,7 @@ pub fn initialize_ix(creator: Pubkey, token_mint: Pubkey, wsol: Pubkey, creator_
             AccountMeta::new(creator_token, false),
             AccountMeta::new_readonly(anchor_spl::token::ID, false),
             AccountMeta::new_readonly(anchor_lang::system_program::ID, false),
+            AccountMeta::new_readonly(coin_token_program, false),
         ],
         data,
     }
