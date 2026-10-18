@@ -1795,6 +1795,28 @@
         {
           "name": "storage",
           "writable": true
+        },
+        {
+          "name": "config_ext",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  101,
+                  120,
+                  116
+                ]
+              }
+            ]
+          }
         }
       ],
       "args": [
@@ -2070,6 +2092,28 @@
         {
           "name": "storage",
           "writable": true
+        },
+        {
+          "name": "config_ext",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  101,
+                  120,
+                  116
+                ]
+              }
+            ]
+          }
         }
       ],
       "args": [
@@ -2940,7 +2984,7 @@
             "Only the program's upgrade authority can initialise the config, so nobody",
             "can grab a freshly deployed program first."
           ],
-          "address": "B7YjFBeDvKZ7BfEg6YyhKci28F6cAjVn3z5gtorcvJhi"
+          "address": "8f9XtMzn9J8vapxoLoypKUjNta64jhjfr18WMVCn5yAk"
         },
         {
           "name": "program_data"
@@ -4748,6 +4792,11 @@
       "code": 6042,
       "name": "BadCommitment",
       "msg": "Bad commitment account"
+    },
+    {
+      "code": 6043,
+      "name": "NotVanityMint",
+      "msg": "A Velvet coin's address must end in vLvt"
     }
   ],
   "types": [
@@ -5357,6 +5406,14 @@
             "type": "u64"
           },
           {
+            "name": "allow_any_mint",
+            "docs": [
+              "Let coins launch at any mint address. Off (the default), every coin's mint must end in",
+              "VANITY_SUFFIX."
+            ],
+            "type": "bool"
+          },
+          {
             "name": "_spare",
             "docs": [
               "Room for later settings without moving the layout."
@@ -5364,7 +5421,7 @@
             "type": {
               "array": [
                 "u8",
-                21
+                20
               ]
             }
           },
