@@ -1327,13 +1327,7 @@ pub mod fairlaunch {
         let system = a.system_program.to_account_info();
         let token_prog = a.token_program.to_account_info();
         let coin_tp = a.coin_token_program.to_account_info();
-        let pool_sol = a.launch.grad_pool_sol;
         let grad_fee = a.launch.grad_fee_paid;
-        // The pool opens at the curve's last price: tokens beyond what pool_sol buys at that price
-        // are burned, so nobody can buy the gap right after graduation.
-        let at_price = (pool_sol as u128).checked_mul(a.launch.virtual_token as u128).ok_or(FairError::Overflow)? / (a.launch.virtual_sol as u128).max(1);
-        let lp_reserve = (a.launch.lp_reserve as u128).min(at_price) as u64;
-        let burn = a.launch.lp_reserve - lp_reserve;
 
         for (ata, m, tp) in [(a.grad_wsol.to_account_info(), a.wsol_mint.to_account_info(), &token_prog), (a.grad_token.to_account_info(), a.mint.to_account_info(), &coin_tp)] {
             associated_token::create_idempotent(CpiContext::new_with_signer(
@@ -1349,6 +1343,15 @@ pub mod fairlaunch {
                 gsig,
             ))?;
         }
+        // The graduation overhead is sized for Raydium; a Velvet pool costs far less to set up.
+        // Everything beyond the pool's setup reserve and the fee float goes into the pool too.
+        let spare = a.grad_auth.lamports().saturating_sub(a.launch.grad_pool_sol.saturating_add(VELVET_SETUP_RESERVE + GRAD_AUTH_FLOAT));
+        let pool_sol = a.launch.grad_pool_sol + spare;
+        // The pool opens at the curve's last price: tokens beyond what pool_sol buys at that price
+        // are burned, so nobody can buy the gap right after graduation.
+        let at_price = (pool_sol as u128).checked_mul(a.launch.virtual_token as u128).ok_or(FairError::Overflow)? / (a.launch.virtual_sol as u128).max(1);
+        let lp_reserve = (a.launch.lp_reserve as u128).min(at_price) as u64;
+        let burn = a.launch.lp_reserve - lp_reserve;
         pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.grad_wsol.to_account_info(), pool_sol, gsig)?;
         token::sync_native(CpiContext::new(token_prog.clone(), token::SyncNative { account: a.grad_wsol.to_account_info() }))?;
         if burn > 0 {
@@ -1377,8 +1380,8 @@ pub mod fairlaunch {
             ],
             gsig,
         )?;
-        // The emptied WSOL account's rent goes back to the graduation authority; leftover
-        // overhead to the treasury, keeping a float for fee collection.
+        // The emptied WSOL account's rent goes back to the graduation authority; what's left of
+        // the setup reserve to the treasury, keeping a float for fee collection.
         token::close_account(CpiContext::new_with_signer(
             token_prog,
             token::CloseAccount { account: a.grad_wsol.to_account_info(), destination: a.grad_auth.to_account_info(), authority: a.grad_auth.to_account_info() },
@@ -1388,6 +1391,7 @@ pub mod fairlaunch {
         pay_from_system_pda(&system, &a.grad_auth.to_account_info(), &a.treasury.to_account_info(), left, gsig)?;
 
         let l = &mut ctx.accounts.launch;
+        l.grad_pool_sol = pool_sol;
         l.graduated = true;
         l.lp_locked = true; // no LP tokens exist: the pool has no withdraw
         l.pool = pool;

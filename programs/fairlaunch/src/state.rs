@@ -24,6 +24,9 @@ pub const MIN_POOL_SOL: u64 = 100_000_000;
 /// Lamports set aside at graduation for Raydium's pool-creation fee and the
 /// rent of the accounts it creates. Whatever is left goes to the treasury.
 pub const GRAD_OVERHEAD: u64 = 300_000_000;
+/// Lamports kept back from a Velvet pool's liquidity to pay the rent of the pool and its
+/// vaults (about 0.007 SOL); the rest of GRAD_OVERHEAD goes into the pool.
+pub const VELVET_SETUP_RESERVE: u64 = 15_000_000;
 /// Lamports the graduation authority keeps so it can re-create its fee
 /// accounts when collecting Raydium creator fees.
 pub const GRAD_AUTH_FLOAT: u64 = 10_000_000;

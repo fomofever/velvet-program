@@ -2171,3 +2171,30 @@ fn only_real_token_accounts_count_as_holders() {
     let e = distribute(&mut env, &l, &dist, &[(thief.pubkey(), pool / 2)]).unwrap_err();
     assert!(e.contains("BadRewardAccount"), "{e}");
 }
+
+#[test]
+fn unspent_graduation_overhead_goes_into_the_velvet_pool() {
+    let mut env = setup_ext(vp_ext());
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(77), 0, 0, 0).unwrap();
+    let ws = fill_line(&mut env, &l, 60);
+    advance(&mut env.svm, AUCTION, 20);
+    settle(&mut env, &l, &ws[0]).unwrap();
+    finish_curve(&mut env, &l);
+    let raised = launch_state(&env.svm, &l.launch).real_sol;
+    let t0 = bal(&env.svm, &env.treasury);
+    graduate_velvet(&mut env, &l, &ws[1]).unwrap();
+    let s = launch_state(&env.svm, &l.launch);
+    let pool = vpools::pool(&l.mint);
+    let sv = tok(&env.svm, &vpools::vault(&pool, &wsol()));
+    let tv = tok(&env.svm, &vpools::vault(&pool, &l.mint));
+    let to_treasury = bal(&env.svm, &env.treasury) - t0;
+    println!("raised {:.4} SOL, pool {:.4} SOL, treasury {:.4} SOL (fee {:.4})", raised as f64 / 1e9, sv as f64 / 1e9, to_treasury as f64 / 1e9, s.grad_fee_paid as f64 / 1e9);
+    assert_eq!(sv, s.grad_pool_sol);
+    // Only the graduation fee and a few thousandths of setup reserve leave the coin.
+    assert!(to_treasury >= s.grad_fee_paid && to_treasury - s.grad_fee_paid < VELVET_SETUP_RESERVE, "treasury got {to_treasury}");
+    assert!(sv > raised - s.grad_fee_paid - VELVET_SETUP_RESERVE - GRAD_AUTH_FLOAT - 10_000_000, "pool got {sv} of {raised}");
+    // And the pool still opens at the curve's last price.
+    let curve_end = s.virtual_sol as f64 / s.virtual_token as f64;
+    assert!((sv as f64 / tv as f64 / curve_end - 1.0).abs() < 1e-6, "the pool opens at the curve's last price");
+}
