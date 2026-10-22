@@ -286,6 +286,18 @@ pub struct Pass {
 }
 
 pub const PASS_SEED: &[u8] = b"pass";
+pub const LEDGER_SEED: &[u8] = b"ledger";
+
+/// What one wallet has taken from one coin while it bonds: curve buys in, curve sells out. With the
+/// wallet's line share and (for the creator) the opening bag, this is what the 3% cap counts, so
+/// moving tokens to another account between buys doesn't make room for more.
+#[account]
+#[derive(InitSpace)]
+pub struct Ledger {
+    pub bought: u64,
+    pub sold: u64,
+    pub bump: u8,
+}
 pub const PASS_MIN_LINE_SOL: u64 = 100_000_000;
 /// Defaults for the "real launch" test a line must pass to count (see ExtParams).
 pub const PASS_DEFAULT_MIN_COMMITTERS: u16 = 10;

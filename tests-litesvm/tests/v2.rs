@@ -341,8 +341,25 @@ fn trade(env: &mut Env, l: &L, u: &Keypair, buy: bool, amount: u64) -> Result<()
             system_program: system_program::ID,
             commitment: Pubkey::find_program_address(&[COMMIT_SEED, l.launch.as_ref(), u.pubkey().as_ref()], &pid()).0,
             pass: pass_pda(&u.pubkey()),
+            ledger: ledger_pda(l, &u.pubkey()),
         }.to_account_metas(None),
         data,
+    };
+    send(&mut env.svm, vec![ix], u).map(|_| ())
+}
+fn ledger_pda(l: &L, u: &Pubkey) -> Pubkey { Pubkey::find_program_address(&[LEDGER_SEED, l.launch.as_ref(), u.as_ref()], &pid()).0 }
+/// Move coins from one wallet's token account to another wallet's (creating it).
+fn send_coins(env: &mut Env, l: &L, from: &Keypair, to: &Pubkey, amount: u64) -> Result<(), String> {
+    let mk = spl_associated_token_account::instruction::create_associated_token_account_idempotent(&from.pubkey(), to, &l.mint, &l.tp);
+    let mut tx = spl_token::instruction::transfer_checked(&spl_token::ID, &l.ata(&from.pubkey()), &l.mint, &l.ata(to), &from.pubkey(), &[], amount, 6).unwrap();
+    tx.program_id = l.tp;
+    send(&mut env.svm, vec![mk, tx], from).map(|_| ())
+}
+fn close_ledger(env: &mut Env, l: &L, u: &Keypair) -> Result<(), String> {
+    let ix = Instruction {
+        program_id: pid(),
+        accounts: fairlaunch::accounts::CloseLedger { user: u.pubkey(), launch: l.launch, ledger: ledger_pda(l, &u.pubkey()), commitment: Pubkey::find_program_address(&[COMMIT_SEED, l.launch.as_ref(), u.pubkey().as_ref()], &pid()).0 }.to_account_metas(None),
+        data: fairlaunch::instruction::CloseLedger {}.data(),
     };
     send(&mut env.svm, vec![ix], u).map(|_| ())
 }
@@ -904,6 +921,46 @@ fn no_wallet_can_buy_past_three_percent_while_bonding() {
     assert!(held <= MAX_WALLET_TOKENS_BONDING && held > MAX_WALLET_TOKENS_BONDING * 8 / 10, "held {held}");
     // selling is never limited
     trade(&mut env, &l, &whale, false, held / 2).unwrap();
+}
+
+/// The cap counts by wallet, not by token account: moving coins to another account between buys
+/// doesn't make room for more. Selling does, and the ledger can be closed once the coin bonds.
+#[test]
+fn moving_coins_away_doesnt_reset_the_three_percent_cap() {
+    let mut env = setup();
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(49), 0, 0, 0).unwrap();
+    let a = user(&mut env.svm, 20);
+    commit(&mut env, &l, &a, SOL / 10).unwrap();
+    advance(&mut env.svm, AUCTION + DECAY, 400);
+    settle(&mut env, &l, &a).unwrap();
+    let whale = user(&mut env.svm, 60);
+    let mut n = 0;
+    while trade(&mut env, &l, &whale, true, SOL / 2).is_ok() { n += 1; assert!(n < 100); }
+    let held = tok(&env.svm, &l.ata(&whale.pubkey()));
+    assert!(held > MAX_WALLET_TOKENS_BONDING * 8 / 10, "held {held}");
+    // park everything in another wallet: the token account is empty, but the wallet's buys still count
+    let other = Keypair::new();
+    send_coins(&mut env, &l, &whale, &other.pubkey(), held).unwrap();
+    assert_eq!(tok(&env.svm, &l.ata(&whale.pubkey())), 0);
+    let e = trade(&mut env, &l, &whale, true, SOL / 2).unwrap_err();
+    assert!(e.contains("WalletCapExceeded"), "{e}");
+    // a line share moved away counts the same way
+    claim(&mut env, &l, &a).unwrap();
+    let share = tok(&env.svm, &l.ata(&a.pubkey()));
+    send_coins(&mut env, &l, &a, &other.pubkey(), share).unwrap();
+    let room = MAX_WALLET_TOKENS_BONDING - share;
+    let mut bought = 0u64;
+    while trade(&mut env, &l, &a, true, SOL / 4).is_ok() { bought = tok(&env.svm, &l.ata(&a.pubkey())); }
+    assert!(bought <= room, "line share {share} + curve buys {bought} went past 3%");
+    // selling frees room again
+    let mine = tok(&env.svm, &l.ata(&a.pubkey()));
+    trade(&mut env, &l, &a, false, mine).unwrap();
+    trade(&mut env, &l, &a, true, SOL / 4).unwrap();
+    // the ledger stays while the coin bonds, and can be closed once the cap no longer applies
+    let e = close_ledger(&mut env, &l, &whale).unwrap_err();
+    assert!(e.contains("NotComplete"), "{e}");
+    assert!(env.svm.get_account(&ledger_pda(&l, &whale.pubkey())).is_some());
 }
 
 /// The 3% cap also holds in the line and for the creator's opening buy: nobody can get more
@@ -1559,7 +1616,8 @@ fn a_big_line_unlocks_a_quarter_at_open_and_the_rest_over_an_hour() {
     advance(&mut env.svm, 10, 3_600);
     claim(&mut env, &l, a).unwrap();
     assert_eq!(tok(&env.svm, &a_ata), share, "everything after the hour");
-    assert!(env.svm.get_account(&commit_pda(&l, &a.pubkey())).map(|x| x.lamports == 0 || x.data.is_empty()).unwrap_or(true), "commitment closed");
+    // While the coin bonds the spot stays open (its share keeps counting toward the 3% cap).
+    assert!(env.svm.get_account(&commit_pda(&l, &a.pubkey())).map(|x| !x.data.is_empty()).unwrap_or(false), "spot kept while bonding");
     assert!(claim(&mut env, &l, a).is_err(), "can't claim twice");
     // Someone who waits the whole hour gets everything in one claim.
     let b = &ws[4];
@@ -1831,6 +1889,14 @@ fn coins_bond_into_velvet_pools_with_locked_liquidity() {
     let pool_price = sv as f64 / tv as f64;
     println!("velvet pool: {:.2} SOL, {:.1}M tokens, gap to curve {:.2}%", sv as f64 / 1e9, tv as f64 / 1e12, (1.0 - pool_price / curve_end) * 100.0);
     assert!((pool_price / curve_end - 1.0).abs() < 1e-6, "the pool opens at the curve's last price");
+    // Bonded: the 3% cap is gone, so a claimed line spot can be closed for its rent.
+    let w = &ws[0];
+    let cp = Pubkey::find_program_address(&[COMMIT_SEED, l.launch.as_ref(), w.pubkey().as_ref()], &pid()).0;
+    assert!(env.svm.get_account(&cp).map(|x| !x.data.is_empty()).unwrap_or(false), "claimed spot kept while bonding");
+    let before = env.svm.get_balance(&w.pubkey()).unwrap();
+    close_ledger(&mut env, &l, w).unwrap();
+    assert!(env.svm.get_account(&cp).map(|x| x.data.is_empty()).unwrap_or(true), "spot closed");
+    assert!(env.svm.get_balance(&w.pubkey()).unwrap() + 10_000 > before, "rent back (less the fee)");
     // The Raydium path is closed while Velvet Pools is on.
     let late = user(&mut env.svm, 5);
     let _ = ws;

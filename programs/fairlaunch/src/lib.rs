@@ -926,7 +926,9 @@ pub mod fairlaunch {
         }
         c.claimed = c.claimed.checked_add(tokens).ok_or(FairError::Overflow)?;
         c.refunded = true;
-        if c.claimed >= share {
+        // While the coin bonds, a fully claimed spot stays open: its line share keeps counting toward
+        // the wallet's 3% (close_ledger returns the rent once the coin has bonded).
+        if c.claimed >= share && (share == 0 || l.complete || l.graduated) {
             close_account(&info, &ctx.accounts.user.to_account_info())?;
         } else {
             write_commitment(&info, &c, &ctx.accounts.user.to_account_info(), &ctx.accounts.system_program.to_account_info())?;
@@ -1005,6 +1007,28 @@ pub mod fairlaunch {
             .checked_add(pending_line).ok_or(FairError::Overflow)?
             .checked_add(in_escrow).ok_or(FairError::Overflow)?;
         require!(held_after <= MAX_WALLET_TOKENS_BONDING, FairError::WalletCapExceeded);
+        // The same cap counted by wallet rather than by token account: everything this wallet has
+        // taken from the coin (curve buys, its whole line share, the creator's whole bag) minus its
+        // curve sells. Tokens moved to another account still count.
+        let line_total = {
+            let info = ctx.accounts.commitment.to_account_info();
+            if info.owner == &crate::ID && !info.data_is_empty() && l.total_committed > 0 {
+                let c = read_commitment(&info)?;
+                math::pro_rata(l.batch_tokens, c.amount, l.total_committed).fx()?
+            } else {
+                0
+            }
+        };
+        let bag = if ctx.accounts.user.key() == l.creator { l.creator_tokens } else { 0 };
+        let lg = &mut ctx.accounts.ledger;
+        lg.bump = ctx.bumps.ledger;
+        let by_wallet = lg.bought
+            .checked_add(line_total).ok_or(FairError::Overflow)?
+            .checked_add(bag).ok_or(FairError::Overflow)?
+            .saturating_sub(lg.sold)
+            .checked_add(q.tokens_out).ok_or(FairError::Overflow)?;
+        require!(by_wallet <= MAX_WALLET_TOKENS_BONDING, FairError::WalletCapExceeded);
+        lg.bought = lg.bought.checked_add(q.tokens_out).ok_or(FairError::Overflow)?;
 
         let system = ctx.accounts.system_program.to_account_info();
         let user = ctx.accounts.user.to_account_info();
@@ -1051,6 +1075,9 @@ pub mod fairlaunch {
         require!(out >= min_lamports_out, FairError::Slippage);
 
         send_coin(&ctx.accounts.token_program.to_account_info(), &ctx.accounts.mint.to_account_info(), &ctx.accounts.user_ata.to_account_info(), &ctx.accounts.vault.to_account_info(), &ctx.accounts.user.to_account_info(), tokens_in, &[])?;
+        let lg = &mut ctx.accounts.ledger;
+        lg.bump = ctx.bumps.ledger;
+        lg.sold = lg.sold.saturating_add(tokens_in);
         l.virtual_sol -= gross;
         l.virtual_token += tokens_in;
         l.real_sol -= gross;
@@ -1062,6 +1089,33 @@ pub mod fairlaunch {
             launch: l.key(), user: ctx.accounts.user.key(), is_buy: false, sol_amount: out, token_amount: tokens_in,
             fee, fee_bps, to_holders, virtual_sol: l.virtual_sol, virtual_token: l.virtual_token,
         });
+        Ok(())
+    }
+
+    /// Once a coin has bonded (or its launch was called off) the 3% cap no longer applies: a wallet
+    /// closes its ledger for that coin, and its fully claimed line spot, and gets the rent back.
+    pub fn close_ledger(ctx: Context<CloseLedger>) -> Result<()> {
+        let l = &ctx.accounts.launch;
+        require!(l.complete || l.graduated || l.cancelled, FairError::NotComplete);
+        let user = ctx.accounts.user.to_account_info();
+        let mut closed = false;
+        let lg = ctx.accounts.ledger.to_account_info();
+        if lg.owner == &crate::ID && !lg.data_is_empty() {
+            require!(lg.try_borrow_data()?[..8] == *Ledger::DISCRIMINATOR, FairError::BadCommitment);
+            close_account(&lg, &user)?;
+            closed = true;
+        }
+        let ci = ctx.accounts.commitment.to_account_info();
+        if ci.owner == &crate::ID && !ci.data_is_empty() {
+            let c = read_commitment(&ci)?;
+            let share = if l.cancelled || l.total_committed == 0 { 0 } else { math::pro_rata(l.batch_tokens, c.amount, l.total_committed).fx()? };
+            // Only a spot with nothing left to claim (a refund still owed is paid by claim).
+            if c.claimed >= share && (c.refunded || l.batch_refund == 0) && !l.cancelled {
+                close_account(&ci, &user)?;
+                closed = true;
+            }
+        }
+        require!(closed, FairError::NothingToClaim);
         Ok(())
     }
 
@@ -1982,6 +2036,25 @@ pub struct TradeCtx<'info> {
     pub commitment: UncheckedAccount<'info>,
     #[account(init_if_needed, payer = user, space = 8 + Pass::INIT_SPACE, seeds = [PASS_SEED, user.key().as_ref()], bump)]
     pub pass: Box<Account<'info, Pass>>,
+    #[account(init_if_needed, payer = user, space = 8 + Ledger::INIT_SPACE, seeds = [LEDGER_SEED, launch.key().as_ref(), user.key().as_ref()], bump)]
+    pub ledger: Box<Account<'info, Ledger>>,
+}
+
+/// Once a coin has bonded (or its launch was called off) the 3% cap no longer applies, so a wallet
+/// can close its ledger for that coin and get the rent back.
+#[derive(Accounts)]
+pub struct CloseLedger<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(seeds = [LAUNCH_SEED, launch.mint.as_ref()], bump = launch.bump)]
+    pub launch: Box<Account<'info, Launch>>,
+    /// CHECK: the wallet's ledger for this coin, if it has one (seeds pin it; owner and
+    /// discriminator checked in the handler).
+    #[account(mut, seeds = [LEDGER_SEED, launch.key().as_ref(), user.key().as_ref()], bump)]
+    pub ledger: UncheckedAccount<'info>,
+    /// CHECK: the wallet's line spot for this coin, if any (seeds pin it; read by hand).
+    #[account(mut, seeds = [COMMIT_SEED, launch.key().as_ref(), user.key().as_ref()], bump)]
+    pub commitment: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
