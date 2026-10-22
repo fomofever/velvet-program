@@ -1,2 +1,7 @@
 target/
 tests-litesvm/target/
+
+# Devnet program dumps from tests-litesvm/fetch-fixtures.sh (not ours to commit)
+tests-litesvm/fixtures/raydium_cpmm.so
+tests-litesvm/fixtures/raydium_lock.so
+tests-litesvm/fixtures/mpl_token_metadata.so
