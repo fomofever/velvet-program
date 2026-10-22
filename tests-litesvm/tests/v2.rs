@@ -221,6 +221,10 @@ fn tok(svm: &LiteSVM, a: &Pubkey) -> u64 {
 }
 fn bal(svm: &LiteSVM, a: &Pubkey) -> u64 { svm.get_balance(a).unwrap_or(0) }
 fn slot(svm: &LiteSVM) -> u64 { svm.get_sysvar::<Clock>().slot }
+/// The launch's own clock: ticks of TICK_MS for timed launches, slots for older ones.
+fn launch_now(svm: &LiteSVM, s: &Launch) -> u64 {
+    if s.timed { (svm.get_sysvar::<Clock>().unix_timestamp.max(0) as u64) * 1000 / TICK_MS } else { slot(svm) }
+}
 fn advance(svm: &mut LiteSVM, slots: u64, secs: i64) {
     let mut c = svm.get_sysvar::<Clock>();
     c.slot += slots;
@@ -923,6 +927,32 @@ fn no_wallet_can_buy_past_three_percent_while_bonding() {
     trade(&mut env, &l, &whale, false, held / 2).unwrap();
 }
 
+/// Lines and the cover charge run on clock time: faster blocks don't shorten them.
+#[test]
+fn lines_and_the_cover_charge_run_on_clock_time_not_block_count() {
+    let mut env = setup();
+    let creator = user(&mut env.svm, 10);
+    let l = create(&mut env, &creator, seed(47), 0, 0, 0).unwrap();
+    let s = launch_state(&env.svm, &l.launch);
+    assert!(s.timed);
+    let line_secs = ((s.auction_end_slot - s.created_slot) * TICK_MS / 1000) as i64;
+    let a = user(&mut env.svm, 20);
+    commit(&mut env, &l, &a, SOL / 10).unwrap();
+    // Thousands of fast blocks but little time: the line is still open.
+    advance(&mut env.svm, 5_000, 1);
+    commit(&mut env, &l, &a, SOL / 10).unwrap();
+    let e = settle(&mut env, &l, &a).unwrap_err();
+    assert!(e.contains("AuctionRunning"), "{e}");
+    // Once its time is up it closes, however few blocks passed.
+    advance(&mut env.svm, 1, line_secs);
+    settle(&mut env, &l, &a).unwrap();
+    // The cover charge also decays by time: right after opening it's still high after many blocks.
+    advance(&mut env.svm, 5_000, 1);
+    let s = launch_state(&env.svm, &l.launch);
+    let cfg = config_state(&env);
+    assert!(fairlaunch::math::fee_bps_at(launch_now(&env.svm, &s), s.trading_start_slot, cfg.decay_slots, cfg.max_snipe_fee_bps, cfg.base_fee_bps) > cfg.base_fee_bps * 10);
+}
+
 /// The cap counts by wallet, not by token account: moving coins to another account between buys
 /// doesn't make room for more. Selling does, and the ledger can be closed once the coin bonds.
 #[test]
@@ -1313,7 +1343,7 @@ fn run_fuzz(seed: u64, steps: usize) -> (usize, usize, usize) {
         let mut op = rng.below(13);
         if !fl.is_empty() && rng.chance(75) {
             let probe = launch_state(&env.svm, &fl[rng.below(fl.len() as u64) as usize].l.launch);
-            let now = slot(&env.svm);
+            let now = launch_now(&env.svm, &probe);
             op = if !probe.settled && now < probe.auction_end_slot { [1, 1, 2, 3, 4][rng.below(5) as usize] }
                  else if !probe.settled { 5 }
                  else if probe.complete && !probe.graduated { 12 }
@@ -1333,7 +1363,8 @@ fn run_fuzz(seed: u64, steps: usize) -> (usize, usize, usize) {
             let i = rng.below(fl.len() as u64) as usize;
             let l = fl[i].l;
             let s = launch_state(&env.svm, &l.launch);
-            let now_slot = slot(&env.svm);
+            // the launch's own clock: ticks of TICK_MS for timed launches, slots for older ones
+            let now_slot = launch_now(&env.svm, &s);
             let mut u = rng.below(users.len() as u64) as usize;
             // claims: usually pick someone who is actually owed something
             if op == 6 && rng.chance(80) {
@@ -1766,7 +1797,7 @@ fn vips_pay_half_the_cover_charge() {
     // Both buy the same amount at the same moment; the VIP's fee premium is half.
     let s = launch_state(&env.svm, &l.launch);
     let cfg = config_state(&env);
-    let full = fairlaunch::math::fee_bps_at(slot(&env.svm), s.trading_start_slot, cfg.decay_slots, cfg.max_snipe_fee_bps, cfg.base_fee_bps);
+    let full = fairlaunch::math::fee_bps_at(launch_now(&env.svm, &s), s.trading_start_slot, cfg.decay_slots, cfg.max_snipe_fee_bps, cfg.base_fee_bps);
     assert!(full > 4_000);
     let t0 = bal(&env.svm, &env.treasury);
     trade(&mut env, &l, &guest, true, SOL / 10).unwrap();

@@ -176,6 +176,11 @@ macro_rules! grad_signer {
     };
 }
 
+/// Ticks since the Unix epoch: the clock timed launches count their line and cover charge in.
+fn now_tick(clock: &Clock) -> u64 { (clock.unix_timestamp.max(0) as u64).saturating_mul(1000) / TICK_MS }
+/// The launch's own clock: ticks for timed launches, block slots for older ones.
+fn launch_clock(l: &Launch, clock: &Clock) -> u64 { if l.timed { now_tick(clock) } else { clock.slot } }
+
 fn fee_now(cfg: &Config, l: &Launch, slot: u64) -> u16 {
     math::fee_bps_at(slot, l.trading_start_slot, cfg.decay_slots, cfg.max_snipe_fee_bps, cfg.base_fee_bps)
 }
@@ -404,9 +409,10 @@ fn init_coin<'info>(
     l.virtual_token = cfg.virtual_tokens;
     l.real_token = cfg.curve_tokens;
     l.lp_reserve = TOTAL_SUPPLY - cfg.curve_tokens;
-    l.created_slot = clock.slot;
+    l.timed = true;
+    l.created_slot = now_tick(&clock);
     l.created_at = clock.unix_timestamp;
-    l.auction_end_slot = clock.slot.checked_add(auction_slots).ok_or(FairError::Overflow)?;
+    l.auction_end_slot = l.created_slot.checked_add(auction_slots).ok_or(FairError::Overflow)?;
     l.min_raise = min_raise;
     l.vest_secs = vest_secs;
     l.bump = bump;
@@ -759,8 +765,9 @@ pub mod fairlaunch {
     /// Commit SOL to the opening line.
     pub fn commit(ctx: Context<Commit>, lamports: u64) -> Result<()> {
         require!(lamports > 0, FairError::ZeroAmount);
-        let slot = Clock::get()?.slot;
+        let clock = Clock::get()?;
         let l = &mut ctx.accounts.launch;
+        let slot = launch_clock(l, &clock);
         require!(!l.settled && slot < l.auction_end_slot, FairError::AuctionClosed);
         let info = ctx.accounts.commitment.to_account_info();
         let user_info = ctx.accounts.user.to_account_info();
@@ -817,12 +824,13 @@ pub mod fairlaunch {
         require_keys_eq!(ctx.accounts.treasury.key(), cfg.treasury, FairError::WrongTreasury);
         let l = &mut ctx.accounts.launch;
         require!(!l.settled, FairError::AlreadySettled);
-        require!(clock.slot >= l.auction_end_slot, FairError::AuctionRunning);
+        let now_t = launch_clock(l, &clock);
+        require!(now_t >= l.auction_end_slot, FairError::AuctionRunning);
 
         let total = l.total_committed;
         let mut fee = 0u64;
         l.settled = true;
-        l.trading_start_slot = clock.slot;
+        l.trading_start_slot = now_t;
         l.vest_start = clock.unix_timestamp;
 
         if total < l.min_raise {
@@ -833,7 +841,7 @@ pub mod fairlaunch {
             let mut q = math::quote_buy(l.virtual_sol, l.virtual_token, l.real_token, total - gross_fee).fx()?;
             // A line big enough to fill the whole curve stops just short of it while the cover
             // charge is on; the unused SOL is refunded to the line like any overfill.
-            if q.completes_curve && in_cover_window(cfg, l, clock.slot) && l.real_token > SETTLE_SLIVER_TOKENS {
+            if q.completes_curve && in_cover_window(cfg, l, now_t) && l.real_token > SETTLE_SLIVER_TOKENS {
                 let tokens_out = l.real_token - SETTLE_SLIVER_TOKENS;
                 let sol = math::sol_for_exact_tokens(l.virtual_sol as u128, l.virtual_token as u128, tokens_out as u128).fx()?;
                 q = math::BuyQuote { tokens_out, sol_used: u64::try_from(sol).map_err(|_| error!(FairError::Overflow))?.min(total - gross_fee), completes_curve: false };
@@ -867,7 +875,7 @@ pub mod fairlaunch {
             batch_tokens: l.batch_tokens,
             batch_refund: l.batch_refund,
             fee,
-            trading_start_slot: clock.slot,
+            trading_start_slot: now_t,
             cancelled: l.cancelled,
         });
         Ok(())
@@ -974,10 +982,11 @@ pub mod fairlaunch {
 
     pub fn buy(ctx: Context<TradeCtx>, lamports_in: u64, min_tokens_out: u64) -> Result<()> {
         require!(lamports_in > 0, FairError::ZeroAmount);
-        let slot = Clock::get()?.slot;
+        let clock_now = Clock::get()?;
         let cfg = &ctx.accounts.config;
         require_keys_eq!(ctx.accounts.treasury.key(), cfg.treasury, FairError::WrongTreasury);
         let l = &mut ctx.accounts.launch;
+        let slot = launch_clock(l, &clock_now);
         require!(l.settled, FairError::NotSettled);
         require!(!l.cancelled, FairError::LaunchCancelled);
         require!(!l.complete && !l.graduated, FairError::CurveComplete);
@@ -1051,10 +1060,11 @@ pub mod fairlaunch {
     }
 
     pub fn sell(ctx: Context<TradeCtx>, tokens_in: u64, min_lamports_out: u64) -> Result<()> {
-        let slot = Clock::get()?.slot;
+        let clock_now = Clock::get()?;
         let cfg = &ctx.accounts.config;
         require_keys_eq!(ctx.accounts.treasury.key(), cfg.treasury, FairError::WrongTreasury);
         let l = &mut ctx.accounts.launch;
+        let slot = launch_clock(l, &clock_now);
         require!(l.settled, FairError::NotSettled);
         require!(!l.cancelled, FairError::LaunchCancelled);
         require!(!l.complete && !l.graduated, FairError::CurveComplete);

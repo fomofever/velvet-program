@@ -40,6 +40,9 @@ pub const EPOCH_BATCH_WINDOW_SECS: i64 = 900;
 pub const MAX_BASE_FEE_BPS: u16 = 200;
 pub const MAX_SNIPE_FEE_BPS: u16 = 5_000;
 pub const MAX_GRADUATION_FEE: u64 = 2_000_000_000;
+/// Length of one tick: the line and cover-charge windows are counted in these (the old nominal
+/// slot), from the network clock.
+pub const TICK_MS: u64 = 400;
 pub const MAX_DECAY_SLOTS: u64 = 3_000;
 pub const MAX_AUCTION_SLOTS: u64 = 3_000;
 pub const MIN_REWARD_EPOCH_SECS: i64 = 60;
@@ -241,7 +244,12 @@ pub struct Launch {
     /// must go to a strictly higher wallet address, so no wallet can be paid twice in one epoch
     /// (across all of its batches). Reset when a new epoch starts.
     pub epoch_last_wallet: Pubkey,
-    pub _reserved: [u8; 25],
+    /// The line and the cover charge run on clock time (ticks of TICK_MS from the network clock),
+    /// not block count. Solana's blocks got faster (400 ms to ~200 ms), which halved every
+    /// slot-timed window; ticks keep "1 minute" a minute whatever the block time. Older launches
+    /// read as false and keep slot timing.
+    pub timed: bool,
+    pub _reserved: [u8; 24],
 }
 
 impl Launch {
